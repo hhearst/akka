@@ -59,7 +59,7 @@ class ClusterSingletonRestart2Spec extends AkkaSpec("""
           settings = ClusterSingletonManagerSettings(from).withRole("singleton")),
         name = "echo")
 
-    within(10.seconds) {
+    within(20.seconds) {
       awaitAssert {
         Cluster(from) join Cluster(to).selfAddress
         Cluster(from).state.members.map(_.uniqueAddress) should contain(Cluster(from).selfUniqueAddress)

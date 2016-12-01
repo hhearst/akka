@@ -149,6 +149,8 @@ private[cluster] object InternalClusterAction {
   sealed trait PublishMessage
   final case class PublishChanges(newGossip: Gossip) extends PublishMessage
   final case class PublishEvent(event: ClusterDomainEvent) extends PublishMessage
+
+  final case object ExitingCompleted
 }
 
 /**
@@ -267,6 +269,9 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   var seedNodeProcessCounter = 0 // for unique names
   var leaderActionCounter = 0
 
+  var exitingInProgress = false
+  CoordinatedShutdown(context.system).addNotification("cluster-exiting", self, ExitingCompleted)
+
   /**
    * Looks up and returns the remote cluster command connection for the specific address.
    */
@@ -322,14 +327,14 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
     publishStatsTask foreach { _.cancel() }
   }
 
-  def uninitialized: Actor.Receive = {
+  def uninitialized: Actor.Receive = ({
     case InitJoin                          ⇒ sender() ! InitJoinNack(selfAddress)
     case ClusterUserAction.JoinTo(address) ⇒ join(address)
     case JoinSeedNodes(newSeedNodes)       ⇒ joinSeedNodes(newSeedNodes)
     case msg: SubscriptionMessage          ⇒ publisher forward msg
-  }
+  }: Actor.Receive).orElse(receiveExitingCompleted)
 
-  def tryingToJoin(joinWith: Address, deadline: Option[Deadline]): Actor.Receive = {
+  def tryingToJoin(joinWith: Address, deadline: Option[Deadline]): Actor.Receive = ({
     case Welcome(from, gossip) ⇒ welcome(joinWith, from, gossip)
     case InitJoin              ⇒ sender() ! InitJoinNack(selfAddress)
     case ClusterUserAction.JoinTo(address) ⇒
@@ -346,7 +351,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
         if (seedNodes.nonEmpty) joinSeedNodes(seedNodes)
         else join(joinWith)
       }
-  }
+  }: Actor.Receive).orElse(receiveExitingCompleted)
 
   def becomeUninitialized(): Unit = {
     // make sure that join process is stopped
@@ -364,7 +369,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
     context.become(initialized)
   }
 
-  def initialized: Actor.Receive = {
+  def initialized: Actor.Receive = ({
     case msg: GossipEnvelope              ⇒ receiveGossip(msg)
     case msg: GossipStatus                ⇒ receiveGossipStatus(msg)
     case GossipTick                       ⇒ gossipTick()
@@ -385,10 +390,10 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       logInfo(
         "Trying to join seed nodes [{}] when already part of a cluster, ignoring",
         seedNodes.mkString(", "))
-  }
+  }: Actor.Receive).orElse(receiveExitingCompleted)
 
-  def removed: Actor.Receive = {
-    case msg: SubscriptionMessage ⇒ publisher forward msg
+  def receiveExitingCompleted: Actor.Receive = {
+    case ExitingCompleted ⇒ exitingCompleted()
   }
 
   def receive = uninitialized
@@ -580,6 +585,27 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
     }
   }
 
+  def exitingCompleted() = {
+    logInfo("Exiting completed")
+    // ExitingCompleted sent via CoordinatedShutdown to continue the leaving process.
+    exitingInProgress = false
+    // mark as seen
+    latestGossip = latestGossip seen selfUniqueAddress
+    assertLatestGossip()
+    publish(latestGossip)
+
+    // Let others know (best effort) before shutdown. Otherwise they will not see
+    // convergence of the Exiting state until they have detected this node as
+    // unreachable and the required downing has finished. They will still need to detect
+    // unreachable, but Exiting unreachable will be removed without downing, i.e.
+    // normally the leaving of a leader will be graceful without the need
+    // for downing. However, if those final gossip messages never arrive it is
+    // alright to require the downing, because that is probably caused by a
+    // network failure anyway.
+    gossipRandomN(NumberOfGossipsBeforeShutdownWhenLeaderExits)
+    shutdown()
+  }
+
   /**
    * This method is called when a member sees itself as Exiting or Down.
    */
@@ -725,7 +751,8 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
           (prunedRemoteGossip merge prunedLocalGossip, true, Merge)
       }
 
-      latestGossip = winningGossip seen selfUniqueAddress
+      if (!exitingInProgress)
+        latestGossip = winningGossip seen selfUniqueAddress
       assertLatestGossip()
 
       // for all new joining nodes we remove them from the failure detector
@@ -754,9 +781,15 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       publish(latestGossip)
 
       val selfStatus = latestGossip.member(selfUniqueAddress).status
-      if (selfStatus == Exiting)
-        shutdown()
-      else if (talkback) {
+      if (selfStatus == Exiting && !exitingInProgress) {
+        // ExitingCompleted will be received via CoordinatedShutdown to continue
+        // the leaving process. Meanwhile the gossip state is not marked as seen.
+        exitingInProgress = true
+        logInfo("Exiting, starting coordinated shutdown")
+        CoordinatedShutdown(context.system).run()
+      }
+
+      if (talkback) {
         // send back gossip to sender() when sender() had different view, i.e. merge, or sender() had
         // older or sender() had newer
         gossipTo(from, sender())
@@ -992,6 +1025,15 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       }
       val newGossip = localGossip copy (members = newMembers, overview = newOverview, version = newVersion)
 
+      if (!exitingInProgress && latestGossip.member(selfUniqueAddress).status == Exiting) {
+        // Leader is moving itself from Leaving to Exiting.
+        // ExitingCompleted will be received via CoordinatedShutdown to continue
+        // the leaving process. Meanwhile the gossip state is not marked as seen.
+        exitingInProgress = true
+        logInfo("Exiting (leader), starting coordinated shutdown")
+        CoordinatedShutdown(context.system).run()
+      }
+
       updateLatestGossip(newGossip)
 
       // log status changes
@@ -1006,21 +1048,6 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       }
 
       publish(latestGossip)
-
-      if (latestGossip.member(selfUniqueAddress).status == Exiting) {
-        // Leader is moving itself from Leaving to Exiting. Let others know (best effort)
-        // before shutdown. Otherwise they will not see the Exiting state change
-        // and there will not be convergence until they have detected this node as
-        // unreachable and the required downing has finished. They will still need to detect
-        // unreachable, but Exiting unreachable will be removed without downing, i.e.
-        // normally the leaving of a leader will be graceful without the need
-        // for downing. However, if those final gossip messages never arrive it is
-        // alright to require the downing, because that is probably caused by a
-        // network failure anyway.
-        gossipRandomN(NumberOfGossipsBeforeShutdownWhenLeaderExits)
-        shutdown()
-      }
-
     }
   }
 
@@ -1142,12 +1169,18 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       latestGossip.reachabilityExcludingDownedObservers.isReachable(node))
 
   def updateLatestGossip(newGossip: Gossip): Unit = {
-    // Updating the vclock version for the changes
-    val versionedGossip = newGossip :+ vclockNode
-    // Nobody else have seen this gossip but us
-    val seenVersionedGossip = versionedGossip onlySeen (selfUniqueAddress)
-    // Update the state with the new gossip
-    latestGossip = seenVersionedGossip
+    // Don't mark gossip state as seen while exiting is in progress, e.g.
+    // shutting down singleton actors.
+    if (exitingInProgress)
+      latestGossip = newGossip
+    else {
+      // Updating the vclock version for the changes
+      val versionedGossip = newGossip :+ vclockNode
+      // Nobody else have seen this gossip but us
+      val seenVersionedGossip = versionedGossip onlySeen (selfUniqueAddress)
+      // Update the state with the new gossip
+      latestGossip = seenVersionedGossip
+    }
     assertLatestGossip()
   }
 
