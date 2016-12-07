@@ -97,8 +97,9 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
 
 }
 
-final class CoordinatedShutdown private[akka] (system: ExtendedActorSystem, phases: Map[String, CoordinatedShutdown.Phase])
-  extends Extension {
+final class CoordinatedShutdown private[akka] (
+  system:                   ExtendedActorSystem,
+  private[akka] val phases: Map[String, CoordinatedShutdown.Phase]) extends Extension {
 
   private val log = Logging(system, getClass)
   private val knownPhases = phases.keySet ++ phases.values.flatMap(_.dependsOn)
@@ -107,6 +108,12 @@ final class CoordinatedShutdown private[akka] (system: ExtendedActorSystem, phas
   private val runStarted = new AtomicBoolean(false)
   private val runPromise = Promise[Done]()
 
+  /**
+   * Add a task to a phase. It doesn't remove previously added tasks.
+   * Tasks added to the same phase are executed in parallel without any
+   * ordering assumptions. Next phase will not start until all tasks of
+   * previous phase have been completed.
+   */
   @tailrec def addTask(phase: String)(task: () ⇒ Future[Done]): Unit = {
     require(
       knownPhases(phase),
@@ -122,14 +129,6 @@ final class CoordinatedShutdown private[akka] (system: ExtendedActorSystem, phas
     }
   }
 
-  def addNotification(phase: String, ref: ActorRef, message: Any): Unit = {
-    addTask(phase) {
-      () ⇒
-        ref ! message
-        Future.successful(Done)
-    }
-  }
-
   def run(): Future[Done] = {
     if (runStarted.compareAndSet(false, true)) {
       import system.dispatcher
@@ -141,7 +140,9 @@ final class CoordinatedShutdown private[akka] (system: ExtendedActorSystem, phas
               case null ⇒ Future.successful(Done)
               case tasks ⇒
                 // not that tasks within same phase are performed in parallel
-                val result = Future.sequence(tasks.map(_.apply())).map(_ ⇒ Done)
+                val result = Future.sequence(tasks.map { task ⇒
+                  try task.apply() catch { case NonFatal(e) ⇒ Future.failed(e) }
+                }).map(_ ⇒ Done)
                 val timeout = phases(phase).timeout
                 val timeoutFut = after(timeout, system.scheduler)(Future.failed(
                   new TimeoutException(s"Coordinated shutdown phase [$phase] timed out after $timeout")))

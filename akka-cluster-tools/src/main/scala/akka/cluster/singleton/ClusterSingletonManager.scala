@@ -28,6 +28,8 @@ import akka.cluster.ClusterEvent
 import scala.concurrent.Promise
 import akka.Done
 import akka.actor.CoordinatedShutdown
+import akka.pattern.ask
+import akka.util.Timeout
 
 object ClusterSingletonManagerSettings {
 
@@ -240,7 +242,11 @@ object ClusterSingletonManager {
       // subscribe to MemberEvent, re-subscribe when restart
       override def preStart(): Unit = {
         cluster.subscribe(self, classOf[MemberUp], classOf[MemberRemoved])
-        CoordinatedShutdown(context.system).addNotification(CoordinatedShutdown.PhaseClusterExiting, self, SelfExiting)
+        val coordShutdown = CoordinatedShutdown(context.system)
+        coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
+          implicit val timeout = Timeout(coordShutdown.phases(CoordinatedShutdown.PhaseClusterExiting).timeout)
+          self.ask(SelfExiting).mapTo[Done]
+        }
       }
       override def postStop(): Unit = cluster.unsubscribe(self)
 
@@ -291,7 +297,9 @@ object ClusterSingletonManager {
         case state: CurrentClusterState ⇒ handleInitial(state)
         case MemberUp(m)                ⇒ add(m)
         case MemberRemoved(m, _)        ⇒ remove(m)
-        case SelfExiting                ⇒ remove(cluster.readView.self)
+        case SelfExiting ⇒
+          remove(cluster.readView.self)
+          sender() ! Done // reply to ask
         case GetNext if changes.isEmpty ⇒
           context.become(deliverNext, discardOld = false)
         case GetNext ⇒
@@ -313,6 +321,7 @@ object ClusterSingletonManager {
         case SelfExiting ⇒
           remove(cluster.readView.self)
           deliverChanges()
+          sender() ! Done // reply to ask
       }
 
       def deliverChanges(): Unit = {
@@ -432,10 +441,14 @@ class ClusterSingletonManager(
   }
 
   // for CoordinatedShutdown
+  val coordShutdown = CoordinatedShutdown(context.system)
   val memberExitingProgress = Promise[Done]()
-  CoordinatedShutdown(context.system).addTask(CoordinatedShutdown.PhaseClusterExiting)(() ⇒
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting)(() ⇒
     memberExitingProgress.future)
-  CoordinatedShutdown(context.system).addNotification(CoordinatedShutdown.PhaseClusterExiting, self, SelfExiting)
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
+    implicit val timeout = Timeout(coordShutdown.phases(CoordinatedShutdown.PhaseClusterExiting).timeout)
+    self.ask(SelfExiting).mapTo[Done]
+  }
 
   def logInfo(message: String): Unit =
     if (LogInfo) log.info(message)
@@ -654,6 +667,7 @@ class ClusterSingletonManager(
     case Event(SelfExiting, _) ⇒
       selfMemberExited()
       // complete memberExitingProgress when handOverDone
+      sender() ! Done // reply to ask
       stay
   }
 
@@ -687,6 +701,7 @@ class ClusterSingletonManager(
     case Event(SelfExiting, _) ⇒
       selfMemberExited()
       // complete memberExitingProgress when handOverDone
+      sender() ! Done // reply to ask
       stay
 
   }
@@ -713,6 +728,7 @@ class ClusterSingletonManager(
     case Event(SelfExiting, _) ⇒
       selfMemberExited()
       // complete memberExitingProgress when handOverDone
+      sender() ! Done // reply to ask
       stay
   }
 
@@ -755,6 +771,7 @@ class ClusterSingletonManager(
     case Event(SelfExiting, _) ⇒
       selfMemberExited()
       memberExitingProgress.trySuccess(Done)
+      sender() ! Done // reply to ask
       stay
     case Event(MemberRemoved(m, _), _) if m.uniqueAddress == cluster.selfUniqueAddress && !selfExited ⇒
       logInfo("Self removed, stopping ClusterSingletonManager")

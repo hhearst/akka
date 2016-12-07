@@ -22,38 +22,61 @@ class CoordinatedShutdownSpec extends AkkaSpec {
   def phase(dependsOn: String*): Phase = Phase(dependsOn.toSet, timeout = 10.seconds, recover = true)
   val emptyPhase: Phase = Phase(Set.empty, timeout = 10.seconds, recover = true)
 
+  private def checkTopologicalSort(phases: Map[String, Phase]): List[String] = {
+    val result = CoordinatedShutdown.topologicalSort(phases)
+    result.zipWithIndex.foreach {
+      case (phase, i) ⇒
+        phases.get(phase) match {
+          case Some(Phase(dependsOn, _, _)) ⇒
+            dependsOn.foreach { depPhase ⇒
+              withClue(s"phase [$phase] depends on [$depPhase] but was ordered before it in topological sort result $result") {
+                i should be > result.indexOf(depPhase)
+              }
+            }
+          case None ⇒ // ok
+        }
+    }
+    result
+  }
+
   "CoordinatedShutdown" must {
 
     "sort phases in topolgical order" in {
-      CoordinatedShutdown.topologicalSort(Map.empty) should ===(Nil)
+      checkTopologicalSort(Map.empty) should ===(Nil)
 
-      CoordinatedShutdown.topologicalSort(Map(
+      checkTopologicalSort(Map(
         "a" → emptyPhase)) should ===(List("a"))
 
-      CoordinatedShutdown.topologicalSort(Map(
+      checkTopologicalSort(Map(
         "b" → phase("a"))) should ===(List("a", "b"))
 
-      CoordinatedShutdown.topologicalSort(Map(
-        "c" → phase("a"), "b" → phase("a"))).head should ===("a") // b, c can be in any order
+      val result1 = checkTopologicalSort(Map(
+        "c" → phase("a"), "b" → phase("a")))
+      result1.head should ===("a")
+      // b, c can be in any order
+      result1.toSet should ===(Set("a", "b", "c"))
 
-      CoordinatedShutdown.topologicalSort(Map(
+      checkTopologicalSort(Map(
         "b" → phase("a"), "c" → phase("b"))) should ===(List("a", "b", "c"))
 
-      CoordinatedShutdown.topologicalSort(Map(
+      checkTopologicalSort(Map(
         "b" → phase("a"), "c" → phase("a", "b"))) should ===(List("a", "b", "c"))
 
-      CoordinatedShutdown.topologicalSort(Map(
-        "c" → phase("a", "b"))).last should ===("c") // a, b can be in any order
+      val result2 = checkTopologicalSort(Map(
+        "c" → phase("a", "b")))
+      result2.last should ===("c")
+      // a, b can be in any order
+      result2.toSet should ===(Set("a", "b", "c"))
 
-      CoordinatedShutdown.topologicalSort(Map(
+      checkTopologicalSort(Map(
         "b" → phase("a"), "c" → phase("b"), "d" → phase("b", "c"),
         "e" → phase("d"))) should ===(
         List("a", "b", "c", "d", "e"))
 
-      val result = CoordinatedShutdown.topologicalSort(Map(
+      val result3 = checkTopologicalSort(Map(
         "a2" → phase("a1"), "a3" → phase("a2"),
         "b2" → phase("b1"), "b3" → phase("b2")))
-      val (a, b) = result.partition(_.charAt(0) == 'a')
+      val (a, b) = result3.partition(_.charAt(0) == 'a')
       a should ===(List("a1", "a2", "a3"))
       b should ===(List("b1", "b2", "b3"))
     }

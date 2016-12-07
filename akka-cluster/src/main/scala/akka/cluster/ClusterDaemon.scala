@@ -17,6 +17,9 @@ import scala.collection.breakOut
 import akka.remote.QuarantinedEvent
 import java.util.ArrayList
 import java.util.Collections
+import akka.pattern.ask
+import akka.util.Timeout
+import akka.Done
 
 /**
  * Base trait for all cluster messages. All ClusterMessage's are serializable.
@@ -270,7 +273,11 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   var leaderActionCounter = 0
 
   var exitingInProgress = false
-  CoordinatedShutdown(context.system).addNotification(CoordinatedShutdown.PhaseClusterExitingDone, self, ExitingCompleted)
+  val coordShutdown = CoordinatedShutdown(context.system)
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExitingDone) { () ⇒
+    implicit val timeout = Timeout(coordShutdown.phases(CoordinatedShutdown.PhaseClusterExitingDone).timeout)
+    self.ask(ExitingCompleted).mapTo[Done]
+  }
 
   /**
    * Looks up and returns the remote cluster command connection for the specific address.
@@ -393,7 +400,9 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   }: Actor.Receive).orElse(receiveExitingCompleted)
 
   def receiveExitingCompleted: Actor.Receive = {
-    case ExitingCompleted ⇒ exitingCompleted()
+    case ExitingCompleted ⇒
+      exitingCompleted()
+      sender() ! Done // reply to ask
   }
 
   def receive = uninitialized
@@ -786,7 +795,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
         // the leaving process. Meanwhile the gossip state is not marked as seen.
         exitingInProgress = true
         logInfo("Exiting, starting coordinated shutdown")
-        CoordinatedShutdown(context.system).run()
+        coordShutdown.run()
       }
 
       if (talkback) {
@@ -1031,7 +1040,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
         // the leaving process. Meanwhile the gossip state is not marked as seen.
         exitingInProgress = true
         logInfo("Exiting (leader), starting coordinated shutdown")
-        CoordinatedShutdown(context.system).run()
+        coordShutdown.run()
       }
 
       updateLatestGossip(newGossip)
