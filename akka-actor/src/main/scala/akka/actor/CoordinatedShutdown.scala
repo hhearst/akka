@@ -23,6 +23,10 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
     new CoordinatedShutdown(system, phases)
   }
 
+  val PhaseClusterShardingShutdownRegion = "cluster-sharding-shutdown-region"
+  val PhaseClusterExiting = "cluster-exiting"
+  val PhaseClusterExitingDone = "cluster-exiting-done"
+
   /**
    * INTERNAL API
    */

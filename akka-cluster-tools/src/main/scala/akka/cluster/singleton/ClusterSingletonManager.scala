@@ -199,6 +199,7 @@ object ClusterSingletonManager {
     final case class StoppingData(singleton: ActorRef) extends Data
     case object EndData extends Data
     final case class DelayedMemberRemoved(member: Member)
+    case object SelfExiting
 
     val HandOverRetryTimer = "hand-over-retry"
     val TakeOverRetryTimer = "take-over-retry"
@@ -238,7 +239,8 @@ object ClusterSingletonManager {
 
       // subscribe to MemberEvent, re-subscribe when restart
       override def preStart(): Unit = {
-        cluster.subscribe(self, classOf[MemberEvent])
+        cluster.subscribe(self, classOf[MemberUp], classOf[MemberRemoved])
+        CoordinatedShutdown(context.system).addNotification(CoordinatedShutdown.PhaseClusterExiting, self, SelfExiting)
       }
       override def postStop(): Unit = cluster.unsubscribe(self)
 
@@ -288,8 +290,8 @@ object ClusterSingletonManager {
       def receive = {
         case state: CurrentClusterState ⇒ handleInitial(state)
         case MemberUp(m)                ⇒ add(m)
-        case mEvent: MemberEvent if (mEvent.isInstanceOf[MemberExited] || mEvent.isInstanceOf[MemberRemoved]) ⇒
-          remove(mEvent.member)
+        case MemberRemoved(m, _)        ⇒ remove(m)
+        case SelfExiting                ⇒ remove(cluster.readView.self)
         case GetNext if changes.isEmpty ⇒
           context.become(deliverNext, discardOld = false)
         case GetNext ⇒
@@ -304,16 +306,20 @@ object ClusterSingletonManager {
           context.unbecome()
         case MemberUp(m) ⇒
           add(m)
-          if (changes.nonEmpty) {
-            sendFirstChange()
-            context.unbecome()
-          }
-        case mEvent: MemberEvent if (mEvent.isInstanceOf[MemberExited] || mEvent.isInstanceOf[MemberRemoved]) ⇒
-          remove(mEvent.member)
-          if (changes.nonEmpty) {
-            sendFirstChange()
-            context.unbecome()
-          }
+          deliverChanges
+        case MemberRemoved(m, _) ⇒
+          remove(m)
+          deliverChanges()
+        case SelfExiting ⇒
+          remove(cluster.readView.self)
+          deliverChanges()
+      }
+
+      def deliverChanges(): Unit = {
+        if (changes.nonEmpty) {
+          sendFirstChange()
+          context.unbecome()
+        }
       }
 
     }
@@ -427,7 +433,9 @@ class ClusterSingletonManager(
 
   // for CoordinatedShutdown
   val memberExitingProgress = Promise[Done]()
-  CoordinatedShutdown(context.system).addTask("cluster-pre-exiting")(() ⇒ memberExitingProgress.future)
+  CoordinatedShutdown(context.system).addTask(CoordinatedShutdown.PhaseClusterExiting)(() ⇒
+    memberExitingProgress.future)
+  CoordinatedShutdown(context.system).addNotification(CoordinatedShutdown.PhaseClusterExiting, self, SelfExiting)
 
   def logInfo(message: String): Unit =
     if (LogInfo) log.info(message)
@@ -443,7 +451,7 @@ class ClusterSingletonManager(
     require(!cluster.isTerminated, "Cluster node must not be terminated")
 
     // subscribe to cluster changes, re-subscribe when restart
-    cluster.subscribe(self, ClusterEvent.InitialStateAsEvents, classOf[MemberExited], classOf[MemberRemoved])
+    cluster.subscribe(self, ClusterEvent.InitialStateAsEvents, classOf[MemberRemoved])
 
     setTimer(CleanupTimer, Cleanup, 1.minute, repeat = true)
 
@@ -643,8 +651,8 @@ class ClusterSingletonManager(
     case Event(Terminated(ref), d @ OldestData(singleton, _)) if ref == singleton ⇒
       stay using d.copy(singletonTerminated = true)
 
-    case Event(m: MemberExited, _) ⇒
-      memberExited(m)
+    case Event(SelfExiting, _) ⇒
+      selfMemberExited()
       // complete memberExitingProgress when handOverDone
       stay
   }
@@ -676,8 +684,8 @@ class ClusterSingletonManager(
     case Event(Terminated(ref), d @ WasOldestData(singleton, _, _)) if ref == singleton ⇒
       stay using d.copy(singletonTerminated = true)
 
-    case Event(m: MemberExited, _) ⇒
-      memberExited(m)
+    case Event(SelfExiting, _) ⇒
+      selfMemberExited()
       // complete memberExitingProgress when handOverDone
       stay
 
@@ -702,8 +710,8 @@ class ClusterSingletonManager(
       sender() ! HandOverInProgress
       stay
 
-    case Event(m: MemberExited, _) ⇒
-      memberExited(m)
+    case Event(SelfExiting, _) ⇒
+      selfMemberExited()
       // complete memberExitingProgress when handOverDone
       stay
   }
@@ -738,18 +746,15 @@ class ClusterSingletonManager(
       stop()
   }
 
-  def memberExited(m: MemberExited): Unit = {
-    if (m.member.uniqueAddress == cluster.selfUniqueAddress) {
-      selfExited = true
-      logInfo("Exited [{}]", m.member.address)
-    }
+  def selfMemberExited(): Unit = {
+    selfExited = true
+    logInfo("Exited [{}]", cluster.selfAddress)
   }
 
   whenUnhandled {
-    case Event(m: MemberExited, _) ⇒
-      memberExited(m)
-      if (m.member.uniqueAddress == cluster.selfUniqueAddress)
-        memberExitingProgress.trySuccess(Done)
+    case Event(SelfExiting, _) ⇒
+      selfMemberExited()
+      memberExitingProgress.trySuccess(Done)
       stay
     case Event(MemberRemoved(m, _), _) if m.uniqueAddress == cluster.selfUniqueAddress && !selfExited ⇒
       logInfo("Self removed, stopping ClusterSingletonManager")

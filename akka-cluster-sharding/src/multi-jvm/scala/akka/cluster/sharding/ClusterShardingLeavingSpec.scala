@@ -184,7 +184,11 @@ abstract class ClusterShardingLeavingSpec(config: ClusterShardingLeavingSpecConf
       enterBarrier("after-3")
     }
 
-    "recover after leaving coordinator node" in within(30.seconds) {
+    "recover after leaving coordinator node" in {
+      system.actorSelection(node(first) / "user" / "shardLocations") ! GetLocations
+      val Locations(originalLocations) = expectMsgType[Locations]
+      val firstAddress = node(first).address
+
       runOn(third) {
         cluster.leave(node(first).address)
       }
@@ -196,19 +200,15 @@ abstract class ClusterShardingLeavingSpec(config: ClusterShardingLeavingSpecConf
       enterBarrier("stopped")
 
       runOn(second, third, fourth) {
-        system.actorSelection(node(first) / "user" / "shardLocations") ! GetLocations
-        val Locations(locations) = expectMsgType[Locations]
-        val firstAddress = node(first).address
-        awaitAssert {
-          val probe = TestProbe()
-          locations.foreach {
-            case (id, ref) ⇒
-              region.tell(Ping(id), probe.ref)
+        originalLocations.foreach {
+          case (id, ref) ⇒
+            within(5.seconds) {
+              region ! Ping(id)
               if (ref.path.address == firstAddress)
-                probe.expectMsgType[ActorRef](1.second) should not be (ref)
+                expectMsgType[ActorRef] should not be (ref)
               else
-                probe.expectMsg(1.second, ref) // should not move
-          }
+                expectMsg(ref) // should not move
+            }
         }
       }
 

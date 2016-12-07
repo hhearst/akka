@@ -18,6 +18,8 @@ import scala.collection.immutable
 import scala.concurrent.duration._
 import scala.concurrent.Future
 import scala.reflect.ClassTag
+import scala.concurrent.Promise
+import akka.Done
 
 /**
  * @see [[ClusterSharding$ ClusterSharding extension]]
@@ -372,6 +374,13 @@ class ShardRegion(
   val retryTask = context.system.scheduler.schedule(retryInterval, retryInterval, self, Retry)
   var retryCount = 0
 
+  // for CoordinatedShutdown
+  val gracefulShutdownProgress = Promise[Done]()
+  CoordinatedShutdown(context.system).addTask(CoordinatedShutdown.PhaseClusterShardingShutdownRegion) { () ⇒
+    self ! GracefulShutdown
+    gracefulShutdownProgress.future
+  }
+
   // subscribe to MemberEvent, re-subscribe when restart
   override def preStart(): Unit = {
     cluster.subscribe(self, classOf[MemberEvent])
@@ -380,6 +389,7 @@ class ShardRegion(
   override def postStop(): Unit = {
     super.postStop()
     cluster.unsubscribe(self)
+    gracefulShutdownProgress.trySuccess(Done)
     retryTask.cancel()
   }
 
@@ -603,8 +613,10 @@ class ShardRegion(
   }
 
   private def tryCompleteGracefulShutdown() =
-    if (gracefulShutdownInProgress && shards.isEmpty && shardBuffers.isEmpty)
+    if (gracefulShutdownInProgress && shards.isEmpty && shardBuffers.isEmpty) {
+      println(s"# graceful done") // FIXME
       context.stop(self) // all shards have been rebalanced, complete graceful shutdown
+    }
 
   def register(): Unit = {
     coordinatorSelection.foreach(_ ! registrationMessage)

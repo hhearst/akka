@@ -270,7 +270,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   var leaderActionCounter = 0
 
   var exitingInProgress = false
-  CoordinatedShutdown(context.system).addNotification("cluster-exiting", self, ExitingCompleted)
+  CoordinatedShutdown(context.system).addNotification(CoordinatedShutdown.PhaseClusterExitingDone, self, ExitingCompleted)
 
   /**
    * Looks up and returns the remote cluster command connection for the specific address.
