@@ -9,6 +9,7 @@ import scala.concurrent.Future
 import akka.Done
 import akka.testkit.AkkaSpec
 import com.typesafe.config.ConfigFactory
+import akka.actor.CoordinatedShutdown.Phase
 
 object CoordinatedShutdownSpec {
 
@@ -24,30 +25,31 @@ class CoordinatedShutdownSpec extends AkkaSpec {
       CoordinatedShutdown.topologicalSort(Map.empty) should ===(Nil)
 
       CoordinatedShutdown.topologicalSort(Map(
-        "a" → Set.empty)) should ===(List("a"))
+        "a" → Phase(Set.empty))) should ===(List("a"))
 
       CoordinatedShutdown.topologicalSort(Map(
-        "b" → Set("a"))) should ===(List("a", "b"))
+        "b" → Phase(Set("a")))) should ===(List("a", "b"))
 
       CoordinatedShutdown.topologicalSort(Map(
-        "c" → Set("a"), "b" → Set("a"))).head should ===("a") // b, c can be in any order
+        "c" → Phase(Set("a")), "b" → Phase(Set("a")))).head should ===("a") // b, c can be in any order
 
       CoordinatedShutdown.topologicalSort(Map(
-        "b" → Set("a"), "c" → Set("b"))) should ===(List("a", "b", "c"))
+        "b" → Phase(Set("a")), "c" → Phase(Set("b")))) should ===(List("a", "b", "c"))
 
       CoordinatedShutdown.topologicalSort(Map(
-        "b" → Set("a"), "c" → Set("a", "b"))) should ===(List("a", "b", "c"))
+        "b" → Phase(Set("a")), "c" → Phase(Set("a", "b")))) should ===(List("a", "b", "c"))
 
       CoordinatedShutdown.topologicalSort(Map(
-        "c" → Set("a", "b"))).last should ===("c") // a, b can be in any order
+        "c" → Phase(Set("a", "b")))).last should ===("c") // a, b can be in any order
 
       CoordinatedShutdown.topologicalSort(Map(
-        "b" → Set("a"), "c" → Set("b"), "d" → Set("b", "c"), "e" → Set("d"))) should ===(
+        "b" → Phase(Set("a")), "c" → Phase(Set("b")), "d" → Phase(Set("b", "c")),
+        "e" → Phase(Set("d")))) should ===(
         List("a", "b", "c", "d", "e"))
 
       val result = CoordinatedShutdown.topologicalSort(Map(
-        "a2" → Set("a1"), "a3" → Set("a2"),
-        "b2" → Set("b1"), "b3" → Set("b2")))
+        "a2" → Phase(Set("a1")), "a3" → Phase(Set("a2")),
+        "b2" → Phase(Set("b1")), "b3" → Phase(Set("b2"))))
       val (a, b) = result.partition(_.charAt(0) == 'a')
       a should ===(List("a1", "a2", "a3"))
       b should ===(List("b1", "b2", "b3"))
@@ -56,17 +58,17 @@ class CoordinatedShutdownSpec extends AkkaSpec {
     "detect cycles in phases (non-DAG)" in {
       intercept[IllegalArgumentException] {
         CoordinatedShutdown.topologicalSort(Map(
-          "b" → Set("a"), "a" → Set("b")))
+          "b" → Phase(Set("a")), "a" → Phase(Set("b"))))
       }
 
       intercept[IllegalArgumentException] {
         CoordinatedShutdown.topologicalSort(Map(
-          "c" → Set("a"), "c" → Set("b"), "b" → Set("c")))
+          "c" → Phase(Set("a")), "c" → Phase(Set("b")), "b" → Phase(Set("c"))))
       }
 
       intercept[IllegalArgumentException] {
         CoordinatedShutdown.topologicalSort(Map(
-          "d" → Set("a"), "d" → Set("c"), "c" → Set("b"), "b" → Set("d")))
+          "d" → Phase(Set("a")), "d" → Phase(Set("c")), "c" → Phase(Set("b")), "b" → Phase(Set("d"))))
       }
 
     }
@@ -74,9 +76,9 @@ class CoordinatedShutdownSpec extends AkkaSpec {
     "run ordered phases" in {
       import system.dispatcher
       val phases = Map(
-        "a" → Set.empty[String],
-        "b" → Set("a"),
-        "c" → Set("b", "a"))
+        "a" → Phase(Set.empty),
+        "b" → Phase(Set("a")),
+        "c" → Phase(Set("b", "a")))
       val co = new CoordinatedShutdown(extSys, phases)
       co.addTask("a") { () ⇒
         testActor ! "A"
@@ -104,7 +106,7 @@ class CoordinatedShutdownSpec extends AkkaSpec {
 
     "only run once" in {
       import system.dispatcher
-      val phases = Map("a" → Set.empty[String])
+      val phases = Map("a" → Phase(Set.empty))
       val co = new CoordinatedShutdown(extSys, phases)
       co.addTask("a") { () ⇒
         testActor ! "A"
@@ -119,13 +121,17 @@ class CoordinatedShutdownSpec extends AkkaSpec {
 
     "parse phases from config" in {
       CoordinatedShutdown.phasesFromConfig(ConfigFactory.parseString("""
-        a = []
-        b = [a]
-        c = [a, b]
-      """)) should ===(Map(
-        "a" → Set.empty[String],
-        "b" → Set("a"),
-        "c" → Set("b", "a")))
+        a = {}
+        b {
+         depends-on = [a]
+        }
+        c {
+         depends-on = [a, b]
+        }
+        """)) should ===(Map(
+        "a" → Phase(Set.empty),
+        "b" → Phase(Set("a")),
+        "c" → Phase(Set("b", "a"))))
     }
 
   }

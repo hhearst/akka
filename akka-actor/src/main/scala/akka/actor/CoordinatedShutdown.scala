@@ -23,21 +23,36 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
     new CoordinatedShutdown(system, phases)
   }
 
-  def phasesFromConfig(conf: Config): Map[String, Set[String]] = {
+  /**
+   * INTERNAL API
+   */
+  private[akka] final case class Phase(dependsOn: Set[String])
+
+  /**
+   * INTERNAL API
+   */
+  private[akka] def phasesFromConfig(conf: Config): Map[String, Phase] = {
     import scala.collection.JavaConverters._
     conf.root.unwrapped.asScala.toMap.map {
-      case (k, v: java.util.List[_]) ⇒ (k → v.asScala.map(_.toString).toSet)
+      case (k, v: java.util.Map[_, _]) ⇒
+        val dependsOn = v.get("depends-on") match {
+          case null                 ⇒ Set.empty[String]
+          case d: java.util.List[_] ⇒ d.asScala.map(_.toString).toSet
+          case d ⇒
+            throw new IllegalArgumentException(s"Expected list value for [$k.depends-on], got [$v]")
+        }
+        k → Phase(dependsOn)
       case (k, v) ⇒
-        throw new IllegalArgumentException(s"Expected list value for [$k], got [$v]")
+        throw new IllegalArgumentException(s"Expected object value for [$k], got [$v]")
     }
   }
 
   /**
    * INTERNAL API: https://en.wikipedia.org/wiki/Topological_sorting
    */
-  private[akka] def topologicalSort(phases: Map[String, Set[String]]): List[String] = {
+  private[akka] def topologicalSort(phases: Map[String, Phase]): List[String] = {
     var result = List.empty[String]
-    var unmarked = phases.keySet ++ phases.values.flatten // in case phase is not defined as key
+    var unmarked = phases.keySet ++ phases.values.flatMap(_.dependsOn) // in case phase is not defined as key
     var tempMark = Set.empty[String] // for detecting cycles
 
     while (unmarked.nonEmpty) {
@@ -49,8 +64,9 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
         throw new IllegalArgumentException("Cycle detected in graph of phases. It must be a DAG. " + phases)
       if (unmarked(u)) {
         tempMark += u
-        phases.getOrElse(u, Set.empty).foreach { v ⇒
-          depthFirstSearch(v)
+        phases.get(u) match {
+          case Some(Phase(dependsOn)) ⇒ dependsOn.foreach(depthFirstSearch)
+          case None                   ⇒
         }
         unmarked -= u // permanent mark
         tempMark -= u
@@ -63,9 +79,10 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
 
 }
 
-class CoordinatedShutdown(system: ExtendedActorSystem, phases: Map[String, Set[String]]) extends Extension {
+class CoordinatedShutdown private[akka] (system: ExtendedActorSystem, phases: Map[String, CoordinatedShutdown.Phase])
+  extends Extension {
 
-  private val knownPhases = phases.keySet ++ phases.values.flatten
+  private val knownPhases = phases.keySet ++ phases.values.flatMap(_.dependsOn)
   private val orderedPhases = CoordinatedShutdown.topologicalSort(phases)
   private val tasks = new ConcurrentHashMap[String, Vector[() ⇒ Future[Done]]]
   private val runStarted = new AtomicBoolean(false)
