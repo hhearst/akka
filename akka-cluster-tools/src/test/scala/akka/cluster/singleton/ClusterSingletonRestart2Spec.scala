@@ -98,8 +98,10 @@ class ClusterSingletonRestart2Spec extends AkkaSpec("""
 
         val sys4Config =
           ConfigFactory.parseString(
-            if (RARP(sys1).provider.remoteSettings.Artery.Enabled) s"akka.remote.artery.canonical.port=$sys2port"
-            else s"akka.remote.netty.tcp.port=$sys2port").withFallback(system.settings.config)
+            s"""
+            akka.remote.artery.canonical.port=$sys2port
+            akka.remote.netty.tcp.port=$sys2port
+            """).withFallback(system.settings.config)
 
         ActorSystem(system.name, sys4Config)
       }

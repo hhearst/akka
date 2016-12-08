@@ -28,7 +28,7 @@ object ClusterSpec {
     akka.actor.provider = "cluster"
     akka.remote.log-remote-lifecycle-events = off
     akka.remote.netty.tcp.port = 0
-    #akka.loglevel = DEBUG
+    akka.remote.artery.canonical.port = 0
     """
 
   final case class GossipTo(address: Address)
@@ -109,6 +109,7 @@ class ClusterSpec extends AkkaSpec(ClusterSpec.config) with ImplicitSender {
       val sys2 = ActorSystem("ClusterSpec2", ConfigFactory.parseString("""
         akka.actor.provider = "cluster"
         akka.remote.netty.tcp.port = 0
+        akka.remote.artery.canonical.port = 0
         """))
       try {
         val ref = sys2.actorOf(Props.empty)
