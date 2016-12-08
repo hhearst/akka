@@ -401,6 +401,14 @@ class ShardRegion(
   def coordinatorSelection: Option[ActorSelection] =
     membersByAge.headOption.map(m ⇒ context.actorSelection(RootActorPath(m.address) + coordinatorPath))
 
+  /**
+   * When leaving the coordinator singleton is started rather quickly on next
+   * oldest node and therefore it is good to send the GracefulShutdownReq to
+   * the likely locations of the coordinator.
+   */
+  def gracefulShutdownCoordinatorSelections: List[ActorSelection] =
+    membersByAge.take(2).toList.map(m ⇒ context.actorSelection(RootActorPath(m.address) + coordinatorPath))
+
   var coordinator: Option[ActorRef] = None
 
   def changeMembers(newMembers: immutable.SortedSet[Member]): Unit = {
@@ -766,7 +774,8 @@ class ShardRegion(
     }
   }
 
-  def sendGracefulShutdownToCoordinator(): Unit =
+  def sendGracefulShutdownToCoordinator(): Unit = {
     if (gracefulShutdownInProgress)
-      coordinator.foreach(_ ! GracefulShutdownReq(self))
+      gracefulShutdownCoordinatorSelections.foreach(_ ! GracefulShutdownReq(self))
+  }
 }

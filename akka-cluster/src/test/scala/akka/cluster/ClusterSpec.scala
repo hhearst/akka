@@ -16,6 +16,9 @@ import akka.testkit.TestProbe
 import akka.actor.ActorSystem
 import akka.actor.Props
 import com.typesafe.config.ConfigFactory
+import akka.actor.CoordinatedShutdown
+import akka.cluster.ClusterEvent.MemberEvent
+import akka.cluster.ClusterEvent._
 
 object ClusterSpec {
   val config = """
@@ -137,6 +140,28 @@ class ClusterSpec extends AkkaSpec(ClusterSpec.config) with ImplicitSender {
       testActor.path.address.host should ===(None)
       cluster.remotePathOf(testActor).uid should ===(testActor.path.uid)
       cluster.remotePathOf(testActor).address should ===(selfAddress)
+    }
+
+    "leave via CoordinatedShutdown.run" in {
+      val sys2 = ActorSystem("ClusterSpec2", ConfigFactory.parseString("""
+        akka.actor.provider = "cluster"
+        akka.remote.netty.tcp.port = 0
+        akka.remote.artery.canonical.port = 0
+        """))
+      try {
+        val probe = TestProbe()(sys2)
+        Cluster(sys2).subscribe(probe.ref, classOf[MemberEvent])
+        probe.expectMsgType[CurrentClusterState]
+        Cluster(sys2).join(Cluster(sys2).selfAddress)
+        probe.expectMsgType[MemberUp]
+
+        CoordinatedShutdown(sys2).run()
+        probe.expectMsgType[MemberLeft]
+        probe.expectMsgType[MemberExited]
+        probe.expectMsgType[MemberRemoved]
+      } finally {
+        shutdown(sys2)
+      }
     }
   }
 }

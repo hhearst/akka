@@ -32,6 +32,7 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
     new CoordinatedShutdown(system, phases)
   }
 
+  val PhaseClusterLeave = "cluster-leave"
   val PhaseClusterShardingShutdownRegion = "cluster-sharding-shutdown-region"
   val PhaseClusterExiting = "cluster-exiting"
   val PhaseClusterExitingDone = "cluster-exiting-done"
@@ -99,8 +100,9 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
 }
 
 final class CoordinatedShutdown private[akka] (
-  system:                   ExtendedActorSystem,
-  private[akka] val phases: Map[String, CoordinatedShutdown.Phase]) extends Extension {
+  system: ExtendedActorSystem,
+  phases: Map[String, CoordinatedShutdown.Phase]) extends Extension {
+  import CoordinatedShutdown.Phase
 
   private val log = Logging(system, getClass)
   private val knownPhases = phases.keySet ++ phases.values.flatMap(_.dependsOn)
@@ -124,7 +126,7 @@ final class CoordinatedShutdown private[akka] (
   @tailrec def addTask(phase: String)(task: () ⇒ Future[Done]): Unit = {
     require(
       knownPhases(phase),
-      s"unknown phase [$phase], known phases [$knownPhases]. " +
+      s"Unknown phase [$phase], known phases [$knownPhases]. " +
         "All phases (along with their optional dependencies) must be defined in configuration")
     val current = tasks.get(phase)
     if (current == null) {
@@ -173,7 +175,9 @@ final class CoordinatedShutdown private[akka] (
                 }).map(_ ⇒ Done)
                 val timeout = phases(phase).timeout
                 val timeoutFut = after(timeout, system.scheduler) {
-                  if (recoverEnabled) {
+                  if (result.isCompleted)
+                    Future.successful(Done)
+                  else if (recoverEnabled) {
                     log.warning("Coordinated shutdown phase [{}] timed out after {}", phase, timeout)
                     Future.successful(Done)
                   } else
@@ -189,5 +193,17 @@ final class CoordinatedShutdown private[akka] (
     }
     runPromise.future
   }
+
+  /**
+   * The configured timeout for a given `phase`.
+   * For example useful as timeout when actor `ask` requests
+   * is used as a task.
+   */
+  def timeout(phase: String): FiniteDuration =
+    phases.get(phase) match {
+      case Some(Phase(_, timeout, _)) ⇒ timeout
+      case None ⇒
+        throw new IllegalArgumentException(s"Unknown phase [$phase]. All phases must be defined in configuration")
+    }
 
 }

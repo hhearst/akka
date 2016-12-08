@@ -20,6 +20,8 @@ import java.util.Collections
 import akka.pattern.ask
 import akka.util.Timeout
 import akka.Done
+import scala.concurrent.Future
+import scala.concurrent.Promise
 
 /**
  * Base trait for all cluster messages. All ClusterMessage's are serializable.
@@ -154,6 +156,7 @@ private[cluster] object InternalClusterAction {
   final case class PublishEvent(event: ClusterDomainEvent) extends PublishMessage
 
   final case object ExitingCompleted
+
 }
 
 /**
@@ -169,6 +172,16 @@ private[cluster] final class ClusterDaemon(settings: ClusterSettings) extends Ac
   // for response from GetClusterCoreRef in its constructor.
   // Child actors are therefore created when GetClusterCoreRef is received
   var coreSupervisor: Option[ActorRef] = None
+
+  val coordShutdown = CoordinatedShutdown(context.system)
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterLeave) { () ⇒
+    if (Cluster(context.system).isTerminated)
+      Future.successful(Done)
+    else {
+      implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterLeave))
+      self.ask(CoordinatedShutdownLeave.LeaveReq).mapTo[Done]
+    }
+  }
 
   def createChildren(): Unit = {
     coreSupervisor = Some(context.actorOf(Props[ClusterCoreSupervisor].
@@ -193,6 +206,10 @@ private[cluster] final class ClusterDaemon(settings: ClusterSettings) extends Ac
         context.actorOf(Props(classOf[ClusterMetricsCollector], publisher).
           withDispatcher(context.props.dispatcher), name = "metrics")
       }
+    case CoordinatedShutdownLeave.LeaveReq ⇒
+      val ref = context.actorOf(CoordinatedShutdownLeave.props().withDispatcher(context.props.dispatcher))
+      // forward the ask request
+      ref.forward(CoordinatedShutdownLeave.LeaveReq)
   }
 
 }
@@ -272,11 +289,19 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   var seedNodeProcessCounter = 0 // for unique names
   var leaderActionCounter = 0
 
-  var exitingInProgress = false
+  var exitingTasksInProgress = false
+  val selfExiting = Promise[Done]()
   val coordShutdown = CoordinatedShutdown(context.system)
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
+    selfExiting.future
+  }
   coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExitingDone) { () ⇒
-    implicit val timeout = Timeout(coordShutdown.phases(CoordinatedShutdown.PhaseClusterExitingDone).timeout)
-    self.ask(ExitingCompleted).mapTo[Done]
+    if (Cluster(context.system).isTerminated)
+      Future.successful(Done)
+    else {
+      implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExitingDone))
+      self.ask(ExitingCompleted).mapTo[Done]
+    }
   }
 
   /**
@@ -332,6 +357,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
     failureDetectorReaperTask.cancel()
     leaderActionsTask.cancel()
     publishStatsTask foreach { _.cancel() }
+    selfExiting.trySuccess(Done)
   }
 
   def uninitialized: Actor.Receive = ({
@@ -597,7 +623,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   def exitingCompleted() = {
     logInfo("Exiting completed")
     // ExitingCompleted sent via CoordinatedShutdown to continue the leaving process.
-    exitingInProgress = false
+    exitingTasksInProgress = false
     // mark as seen
     latestGossip = latestGossip seen selfUniqueAddress
     assertLatestGossip()
@@ -760,7 +786,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
           (prunedRemoteGossip merge prunedLocalGossip, true, Merge)
       }
 
-      if (!exitingInProgress)
+      if (!exitingTasksInProgress)
         latestGossip = winningGossip seen selfUniqueAddress
       assertLatestGossip()
 
@@ -790,11 +816,12 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       publish(latestGossip)
 
       val selfStatus = latestGossip.member(selfUniqueAddress).status
-      if (selfStatus == Exiting && !exitingInProgress) {
+      if (selfStatus == Exiting && !exitingTasksInProgress) {
         // ExitingCompleted will be received via CoordinatedShutdown to continue
         // the leaving process. Meanwhile the gossip state is not marked as seen.
-        exitingInProgress = true
+        exitingTasksInProgress = true
         logInfo("Exiting, starting coordinated shutdown")
+        selfExiting.trySuccess(Done)
         coordShutdown.run()
       }
 
@@ -1034,12 +1061,13 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       }
       val newGossip = localGossip copy (members = newMembers, overview = newOverview, version = newVersion)
 
-      if (!exitingInProgress && newGossip.member(selfUniqueAddress).status == Exiting) {
+      if (!exitingTasksInProgress && newGossip.member(selfUniqueAddress).status == Exiting) {
         // Leader is moving itself from Leaving to Exiting.
         // ExitingCompleted will be received via CoordinatedShutdown to continue
         // the leaving process. Meanwhile the gossip state is not marked as seen.
-        exitingInProgress = true
+        exitingTasksInProgress = true
         logInfo("Exiting (leader), starting coordinated shutdown")
+        selfExiting.trySuccess(Done)
         coordShutdown.run()
       }
 
@@ -1180,7 +1208,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   def updateLatestGossip(newGossip: Gossip): Unit = {
     // Don't mark gossip state as seen while exiting is in progress, e.g.
     // shutting down singleton actors.
-    if (exitingInProgress)
+    if (exitingTasksInProgress)
       latestGossip = newGossip
     else {
       // Updating the vclock version for the changes

@@ -200,7 +200,7 @@ abstract class ClusterShardingLeavingSpec(config: ClusterShardingLeavingSpecConf
       enterBarrier("stopped")
 
       runOn(second, third, fourth) {
-        within(5.seconds) {
+        within(15.seconds) {
           awaitAssert {
             val probe = TestProbe()
             originalLocations.foreach {

@@ -244,7 +244,7 @@ object ClusterSingletonManager {
         cluster.subscribe(self, classOf[MemberEvent])
         val coordShutdown = CoordinatedShutdown(context.system)
         coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
-          implicit val timeout = Timeout(coordShutdown.phases(CoordinatedShutdown.PhaseClusterExiting).timeout)
+          implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExiting))
           self.ask(SelfExiting).mapTo[Done]
         }
       }
@@ -458,7 +458,7 @@ class ClusterSingletonManager(
   coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting)(() ⇒
     memberExitingProgress.future)
   coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
-    implicit val timeout = Timeout(coordShutdown.phases(CoordinatedShutdown.PhaseClusterExiting).timeout)
+    implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExiting))
     self.ask(SelfExiting).mapTo[Done]
   }
 
