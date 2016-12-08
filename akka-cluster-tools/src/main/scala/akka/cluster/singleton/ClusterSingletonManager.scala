@@ -241,7 +241,7 @@ object ClusterSingletonManager {
 
       // subscribe to MemberEvent, re-subscribe when restart
       override def preStart(): Unit = {
-        cluster.subscribe(self, classOf[MemberUp], classOf[MemberRemoved])
+        cluster.subscribe(self, classOf[MemberEvent])
         val coordShutdown = CoordinatedShutdown(context.system)
         coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
           implicit val timeout = Timeout(coordShutdown.phases(CoordinatedShutdown.PhaseClusterExiting).timeout)
@@ -297,6 +297,8 @@ object ClusterSingletonManager {
         case state: CurrentClusterState ⇒ handleInitial(state)
         case MemberUp(m)                ⇒ add(m)
         case MemberRemoved(m, _)        ⇒ remove(m)
+        case MemberExited(m) if m.uniqueAddress != cluster.selfUniqueAddress ⇒
+          remove(m)
         case SelfExiting ⇒
           remove(cluster.readView.self)
           sender() ! Done // reply to ask
@@ -318,6 +320,9 @@ object ClusterSingletonManager {
         case MemberRemoved(m, _) ⇒
           remove(m)
           deliverChanges()
+        case MemberExited(m) if m.uniqueAddress != cluster.selfUniqueAddress ⇒
+          remove(m)
+          deliverChanges()
         case SelfExiting ⇒
           remove(cluster.readView.self)
           deliverChanges()
@@ -328,6 +333,13 @@ object ClusterSingletonManager {
         if (changes.nonEmpty) {
           sendFirstChange()
           context.unbecome()
+        }
+      }
+
+      override def unhandled(msg: Any): Unit = {
+        msg match {
+          case _: MemberEvent ⇒ // ok, silence
+          case _              ⇒ super.unhandled(msg)
         }
       }
 

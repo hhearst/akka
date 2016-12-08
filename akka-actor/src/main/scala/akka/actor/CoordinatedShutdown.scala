@@ -132,14 +132,18 @@ final class CoordinatedShutdown private[akka] (
   def run(): Future[Done] = {
     if (runStarted.compareAndSet(false, true)) {
       import system.dispatcher
+      val debugEnabled = log.isDebugEnabled
       def loop(remainingPhases: List[String]): Future[Done] = {
         remainingPhases match {
           case Nil ⇒ Future.successful(Done)
           case phase :: remaining ⇒
             (tasks.get(phase) match {
-              case null ⇒ Future.successful(Done)
+              case null ⇒
+                if (debugEnabled) log.debug("Performing phase [{}] with [0] tasks", phase)
+                Future.successful(Done)
               case tasks ⇒
-                // not that tasks within same phase are performed in parallel
+                if (debugEnabled) log.debug("Performing phase [{}] with [{}] tasks", phase, tasks.size)
+                // note that tasks within same phase are performed in parallel
                 val result = Future.sequence(tasks.map { task ⇒
                   try task.apply() catch { case NonFatal(e) ⇒ Future.failed(e) }
                 }).map(_ ⇒ Done)

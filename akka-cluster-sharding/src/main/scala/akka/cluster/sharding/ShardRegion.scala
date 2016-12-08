@@ -614,7 +614,6 @@ class ShardRegion(
 
   private def tryCompleteGracefulShutdown() =
     if (gracefulShutdownInProgress && shards.isEmpty && shardBuffers.isEmpty) {
-      println(s"# graceful done") // FIXME
       context.stop(self) // all shards have been rebalanced, complete graceful shutdown
     }
 

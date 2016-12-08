@@ -1034,7 +1034,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       }
       val newGossip = localGossip copy (members = newMembers, overview = newOverview, version = newVersion)
 
-      if (!exitingInProgress && latestGossip.member(selfUniqueAddress).status == Exiting) {
+      if (!exitingInProgress && newGossip.member(selfUniqueAddress).status == Exiting) {
         // Leader is moving itself from Leaving to Exiting.
         // ExitingCompleted will be received via CoordinatedShutdown to continue
         // the leaving process. Meanwhile the gossip state is not marked as seen.

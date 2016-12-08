@@ -200,15 +200,18 @@ abstract class ClusterShardingLeavingSpec(config: ClusterShardingLeavingSpecConf
       enterBarrier("stopped")
 
       runOn(second, third, fourth) {
-        originalLocations.foreach {
-          case (id, ref) ⇒
-            within(5.seconds) {
-              region ! Ping(id)
-              if (ref.path.address == firstAddress)
-                expectMsgType[ActorRef] should not be (ref)
-              else
-                expectMsg(ref) // should not move
+        within(5.seconds) {
+          awaitAssert {
+            val probe = TestProbe()
+            originalLocations.foreach {
+              case (id, ref) ⇒
+                region.tell(Ping(id), probe.ref)
+                if (ref.path.address == firstAddress)
+                  probe.expectMsgType[ActorRef](1.second) should not be (ref)
+                else
+                  probe.expectMsg(1.second, ref) // should not move
             }
+          }
         }
       }
 
