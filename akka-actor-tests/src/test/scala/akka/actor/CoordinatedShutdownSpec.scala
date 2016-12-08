@@ -245,6 +245,12 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         "c" → Phase(dependsOn = Set("a", "b"), timeout = 10.seconds, recover = false)))
     }
 
+    // this must be the last test, since it terminates the ActorSystem
+    "terminate ActorSystem" in {
+      Await.result(CoordinatedShutdown(system).run(), 10.seconds) should ===(Done)
+      system.whenTerminated.isCompleted should ===(true)
+    }
+
   }
 
 }

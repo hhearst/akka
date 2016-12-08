@@ -21,6 +21,8 @@ import akka.pattern.after
 import java.util.concurrent.TimeoutException
 import scala.util.control.NonFatal
 import akka.event.Logging
+import akka.dispatch.ExecutionContexts
+import java.util.concurrent.Executors
 
 object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with ExtensionIdProvider {
   override def get(system: ActorSystem): CoordinatedShutdown = super.get(system)
@@ -28,14 +30,24 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
   override def lookup = CoordinatedShutdown
 
   override def createExtension(system: ExtendedActorSystem): CoordinatedShutdown = {
-    val phases = phasesFromConfig(system.settings.config.getConfig("akka.coordinated-shutdown"))
-    new CoordinatedShutdown(system, phases)
+    val conf = system.settings.config.getConfig("akka.coordinated-shutdown")
+    val phases = phasesFromConfig(conf)
+    val terminateActorSystem = conf.getBoolean("terminate-actor-system")
+    val coord = new CoordinatedShutdown(system, phases)
+    if (terminateActorSystem) {
+      coord.addTask(PhaseActorSystemTerminate) { () ⇒
+        system.terminate().map(_ ⇒ Done)(ExecutionContexts.sameThreadExecutionContext)
+      }
+    }
+    coord
   }
 
   val PhaseClusterLeave = "cluster-leave"
   val PhaseClusterShardingShutdownRegion = "cluster-sharding-shutdown-region"
   val PhaseClusterExiting = "cluster-exiting"
   val PhaseClusterExitingDone = "cluster-exiting-done"
+  val PhaseClusterShutdown = "cluster-shutdown"
+  val PhaseActorSystemTerminate = "actor-system-terminate"
 
   /**
    * INTERNAL API
@@ -146,7 +158,7 @@ final class CoordinatedShutdown private[akka] (
         remainingPhases match {
           case Nil ⇒ Future.successful(Done)
           case phase :: remaining ⇒
-            (tasks.get(phase) match {
+            val phaseResult = (tasks.get(phase) match {
               case null ⇒
                 if (debugEnabled) log.debug("Performing phase [{}] with [0] tasks", phase)
                 Future.successful(Done)
@@ -172,10 +184,14 @@ final class CoordinatedShutdown private[akka] (
                       } else
                         Future.failed(e)
                   }
-                }).map(_ ⇒ Done)
+                }).map(_ ⇒ Done)(ExecutionContexts.sameThreadExecutionContext)
                 val timeout = phases(phase).timeout
+                val deadline = Deadline.now + timeout
                 val timeoutFut = after(timeout, system.scheduler) {
-                  if (result.isCompleted)
+                  if (phase == CoordinatedShutdown.PhaseActorSystemTerminate && deadline.hasTimeLeft) {
+                    // too early, i.e. triggered by system termination
+                    result
+                  } else if (result.isCompleted)
                     Future.successful(Done)
                   else if (recoverEnabled) {
                     log.warning("Coordinated shutdown phase [{}] timed out after {}", phase, timeout)
@@ -185,7 +201,11 @@ final class CoordinatedShutdown private[akka] (
                       new TimeoutException(s"Coordinated shutdown phase [$phase] timed out after $timeout"))
                 }
                 Future.firstCompletedOf(List(result, timeoutFut))
-            }).flatMap(_ ⇒ loop(remaining))
+            })
+            if (remaining.isEmpty)
+              phaseResult // avoid flatMap when system terminated in last phase
+            else
+              phaseResult.flatMap(_ ⇒ loop(remaining))
         }
       }
       val done = loop(orderedPhases)

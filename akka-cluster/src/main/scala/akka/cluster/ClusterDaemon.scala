@@ -173,14 +173,24 @@ private[cluster] final class ClusterDaemon(settings: ClusterSettings) extends Ac
   // Child actors are therefore created when GetClusterCoreRef is received
   var coreSupervisor: Option[ActorRef] = None
 
+  val clusterShutdown = Promise[Done]()
   val coordShutdown = CoordinatedShutdown(context.system)
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterLeave) { () ⇒
-    if (Cluster(context.system).isTerminated)
-      Future.successful(Done)
-    else {
-      implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterLeave))
-      self.ask(CoordinatedShutdownLeave.LeaveReq).mapTo[Done]
-    }
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterLeave) {
+    val sys = context.system
+    () ⇒
+      if (Cluster(sys).isTerminated)
+        Future.successful(Done)
+      else {
+        implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterLeave))
+        self.ask(CoordinatedShutdownLeave.LeaveReq).mapTo[Done]
+      }
+  }
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterShutdown) { () ⇒
+    clusterShutdown.future
+  }
+
+  override def postStop(): Unit = {
+    clusterShutdown.trySuccess(Done)
   }
 
   def createChildren(): Unit = {
@@ -295,13 +305,15 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
     selfExiting.future
   }
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExitingDone) { () ⇒
-    if (Cluster(context.system).isTerminated)
-      Future.successful(Done)
-    else {
-      implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExitingDone))
-      self.ask(ExitingCompleted).mapTo[Done]
-    }
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExitingDone) {
+    val sys = context.system
+    () ⇒
+      if (Cluster(sys).isTerminated)
+        Future.successful(Done)
+      else {
+        implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExitingDone))
+        self.ask(ExitingCompleted).mapTo[Done]
+      }
   }
 
   /**
