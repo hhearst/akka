@@ -156,6 +156,14 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         testActor ! "A"
         Future.failed(new RuntimeException("boom"))
       }
+      co.addTask("a") { () ⇒
+        Future {
+          // to verify that b is not performed before a also in case of failure
+          Thread.sleep(100)
+          testActor ! "A"
+          Done
+        }
+      }
       co.addTask("b") { () ⇒
         testActor ! "B"
         Promise[Done]().future // never completed
@@ -165,6 +173,7 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         Future.successful(Done)
       }
       Await.result(co.run(), remainingOrDefault)
+      expectMsg("A")
       expectMsg("A")
       expectMsg("B")
       expectMsg("C")

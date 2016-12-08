@@ -144,20 +144,36 @@ final class CoordinatedShutdown private[akka] (
               case tasks ⇒
                 if (debugEnabled) log.debug("Performing phase [{}] with [{}] tasks", phase, tasks.size)
                 // note that tasks within same phase are performed in parallel
+                val recoverEnabled = phases(phase).recover
                 val result = Future.sequence(tasks.map { task ⇒
-                  try task.apply() catch { case NonFatal(e) ⇒ Future.failed(e) }
+                  try {
+                    val r = task.apply()
+                    if (recoverEnabled) r.recover {
+                      case NonFatal(e) ⇒
+                        log.warning("Task failed in phase [{}]: {}", phase, e.getMessage)
+                        Done
+                    }
+                    else r
+                  } catch {
+                    case NonFatal(e) ⇒
+                      // in case task.apply throws
+                      if (recoverEnabled) {
+                        log.warning("Task failed in phase [{}]: {}", phase, e.getMessage)
+                        Future.successful(Done)
+                      } else
+                        Future.failed(e)
+                  }
                 }).map(_ ⇒ Done)
                 val timeout = phases(phase).timeout
-                val timeoutFut = after(timeout, system.scheduler)(Future.failed(
-                  new TimeoutException(s"Coordinated shutdown phase [$phase] timed out after $timeout")))
-                val resultWithTimeout = Future.firstCompletedOf(List(result, timeoutFut))
-                if (phases(phase).recover)
-                  resultWithTimeout.recover {
-                    case NonFatal(e) ⇒
-                      log.warning(e.getMessage)
-                      Done
-                  }
-                else resultWithTimeout
+                val timeoutFut = after(timeout, system.scheduler) {
+                  if (recoverEnabled) {
+                    log.warning("Coordinated shutdown phase [{}] timed out after {}", phase, timeout)
+                    Future.successful(Done)
+                  } else
+                    Future.failed(
+                      new TimeoutException(s"Coordinated shutdown phase [$phase] timed out after $timeout"))
+                }
+                Future.firstCompletedOf(List(result, timeoutFut))
             }).flatMap(_ ⇒ loop(remaining))
         }
       }
