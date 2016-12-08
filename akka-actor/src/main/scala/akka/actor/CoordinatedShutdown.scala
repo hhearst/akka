@@ -79,7 +79,8 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
 
     def depthFirstSearch(u: String): Unit = {
       if (tempMark(u))
-        throw new IllegalArgumentException("Cycle detected in graph of phases. It must be a DAG. " + phases)
+        throw new IllegalArgumentException("Cycle detected in graph of phases. It must be a DAG. " +
+          s"phase [$u] depends transitively on itself. All dependencies: $phases")
       if (unmarked(u)) {
         tempMark += u
         phases.get(u) match {
@@ -113,6 +114,12 @@ final class CoordinatedShutdown private[akka] (
    * Tasks added to the same phase are executed in parallel without any
    * ordering assumptions. Next phase will not start until all tasks of
    * previous phase have been completed.
+   *
+   * Tasks should typically be registered as early as possible after system
+   * startup. When running the coordinated shutdown tasks that have been registered
+   * will be performed but tasks that are added too late will not be run.
+   * It is possible to add a task to a later phase by a task in an earlier phase
+   * and it will be performed.
    */
   @tailrec def addTask(phase: String)(task: () ⇒ Future[Done]): Unit = {
     require(

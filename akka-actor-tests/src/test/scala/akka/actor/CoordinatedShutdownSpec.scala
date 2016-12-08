@@ -84,6 +84,11 @@ class CoordinatedShutdownSpec extends AkkaSpec {
     "detect cycles in phases (non-DAG)" in {
       intercept[IllegalArgumentException] {
         CoordinatedShutdown.topologicalSort(Map(
+          "a" → phase("a")))
+      }
+
+      intercept[IllegalArgumentException] {
+        CoordinatedShutdown.topologicalSort(Map(
           "b" → phase("a"), "a" → phase("b")))
       }
 
@@ -199,6 +204,25 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         Await.result(result, remainingOrDefault)
       }
       expectNoMsg(200.millis) // C not run
+    }
+
+    "be possible to add tasks in later phase from task in earlier phase" in {
+      import system.dispatcher
+      val phases = Map(
+        "a" → emptyPhase,
+        "b" → phase("a"))
+      val co = new CoordinatedShutdown(extSys, phases)
+      co.addTask("a") { () ⇒
+        testActor ! "A"
+        co.addTask("b") { () ⇒
+          testActor ! "B"
+          Future.successful(Done)
+        }
+        Future.successful(Done)
+      }
+      Await.result(co.run(), remainingOrDefault)
+      expectMsg("A")
+      expectMsg("B")
     }
 
     "parse phases from config" in {
