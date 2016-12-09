@@ -23,6 +23,8 @@ import scala.util.control.NonFatal
 import akka.event.Logging
 import akka.dispatch.ExecutionContexts
 import java.util.concurrent.Executors
+import scala.util.Try
+import scala.concurrent.Await
 
 object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with ExtensionIdProvider {
   override def get(system: ActorSystem): CoordinatedShutdown = super.get(system)
@@ -32,14 +34,44 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
   override def createExtension(system: ExtendedActorSystem): CoordinatedShutdown = {
     val conf = system.settings.config.getConfig("akka.coordinated-shutdown")
     val phases = phasesFromConfig(conf)
-    val terminateActorSystem = conf.getBoolean("terminate-actor-system")
     val coord = new CoordinatedShutdown(system, phases)
-    if (terminateActorSystem) {
+    initPhaseActorSystemTerminate(system, conf, coord)
+    coord
+  }
+
+  private def initPhaseActorSystemTerminate(system: ActorSystem, conf: Config, coord: CoordinatedShutdown): Unit = {
+    val terminateActorSystem = conf.getBoolean("terminate-actor-system")
+    val exitJvm = conf.getBoolean("exit-jvm")
+    if (terminateActorSystem || exitJvm) {
       coord.addTask(PhaseActorSystemTerminate) { () ⇒
-        system.terminate().map(_ ⇒ Done)(ExecutionContexts.sameThreadExecutionContext)
+        if (exitJvm && terminateActorSystem) {
+          // In case ActorSystem shutdown takes longer than the phase timeout,
+          // exit the JVM forcefully anyway.
+          // We must spawn a separate thread to not block current thread,
+          // since that would have blocked the shutdown of the ActorSystem.
+          val timeout = coord.timeout(PhaseActorSystemTerminate)
+          val t = new Thread {
+            override def run(): Unit = {
+              if (Try(Await.ready(system.whenTerminated, timeout)).isFailure)
+                System.exit(0)
+            }
+          }
+          t.setName("CoordinatedShutdown-exit")
+          t.start()
+        }
+
+        if (terminateActorSystem) {
+          system.terminate().map { _ ⇒
+            if (exitJvm) System.exit(0)
+            Done
+          }(ExecutionContexts.sameThreadExecutionContext)
+        } else if (exitJvm) {
+          System.exit(0)
+          Future.successful(Done)
+        } else
+          Future.successful(Done)
       }
     }
-    coord
   }
 
   val PhaseClusterLeave = "cluster-leave"
