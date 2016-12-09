@@ -25,8 +25,19 @@ import akka.dispatch.ExecutionContexts
 import java.util.concurrent.Executors
 import scala.util.Try
 import scala.concurrent.Await
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicReference
 
 object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with ExtensionIdProvider {
+  val PhaseClusterLeave = "cluster-leave"
+  val PhaseClusterShardingShutdownRegion = "cluster-sharding-shutdown-region"
+  val PhaseClusterExiting = "cluster-exiting"
+  val PhaseClusterExitingDone = "cluster-exiting-done"
+  val PhaseClusterShutdown = "cluster-shutdown"
+  val PhaseActorSystemTerminate = "actor-system-terminate"
+
+  @volatile private var runningJvmHook = false
+
   override def get(system: ActorSystem): CoordinatedShutdown = super.get(system)
 
   override def lookup = CoordinatedShutdown
@@ -36,6 +47,7 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
     val phases = phasesFromConfig(conf)
     val coord = new CoordinatedShutdown(system, phases)
     initPhaseActorSystemTerminate(system, conf, coord)
+    initJvmHook(system, conf, coord)
     coord
   }
 
@@ -52,7 +64,7 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
           val timeout = coord.timeout(PhaseActorSystemTerminate)
           val t = new Thread {
             override def run(): Unit = {
-              if (Try(Await.ready(system.whenTerminated, timeout)).isFailure)
+              if (Try(Await.ready(system.whenTerminated, timeout)).isFailure && !runningJvmHook)
                 System.exit(0)
             }
           }
@@ -62,7 +74,7 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
 
         if (terminateActorSystem) {
           system.terminate().map { _ ⇒
-            if (exitJvm) System.exit(0)
+            if (exitJvm && !runningJvmHook) System.exit(0)
             Done
           }(ExecutionContexts.sameThreadExecutionContext)
         } else if (exitJvm) {
@@ -74,12 +86,25 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
     }
   }
 
-  val PhaseClusterLeave = "cluster-leave"
-  val PhaseClusterShardingShutdownRegion = "cluster-sharding-shutdown-region"
-  val PhaseClusterExiting = "cluster-exiting"
-  val PhaseClusterExitingDone = "cluster-exiting-done"
-  val PhaseClusterShutdown = "cluster-shutdown"
-  val PhaseActorSystemTerminate = "actor-system-terminate"
+  private def initJvmHook(system: ActorSystem, conf: Config, coord: CoordinatedShutdown): Unit = {
+    val runByJvmShutdownHook = conf.getBoolean("run-by-jvm-shutdown-hook")
+    if (runByJvmShutdownHook) {
+      coord.addJvmShutdownHook { () ⇒
+        runningJvmHook = true // avoid System.exit from PhaseActorSystemTerminate task
+        if (!system.whenTerminated.isCompleted) {
+          coord.log.info("Starting coordinated shutdown from JVM shutdown hook")
+          try
+            Await.ready(coord.run(), coord.totalTimeout())
+          catch {
+            case NonFatal(e) ⇒
+              coord.log.warning(
+                "CoordinatedShutdown from JVM shutdown failed: {}",
+                e.getMessage)
+          }
+        }
+      }
+    }
+  }
 
   /**
    * INTERNAL API
@@ -148,12 +173,20 @@ final class CoordinatedShutdown private[akka] (
   phases: Map[String, CoordinatedShutdown.Phase]) extends Extension {
   import CoordinatedShutdown.Phase
 
-  private val log = Logging(system, getClass)
+  /** INTERNAL API */
+  private[akka] val log = Logging(system, getClass)
   private val knownPhases = phases.keySet ++ phases.values.flatMap(_.dependsOn)
   private val orderedPhases = CoordinatedShutdown.topologicalSort(phases)
   private val tasks = new ConcurrentHashMap[String, Vector[() ⇒ Future[Done]]]
   private val runStarted = new AtomicBoolean(false)
   private val runPromise = Promise[Done]()
+
+  private var _jvmHooksLatch = new AtomicReference[CountDownLatch](new CountDownLatch(0))
+
+  /**
+   * INTERNAL API
+   */
+  private[akka] def jvmHooksLatch: CountDownLatch = _jvmHooksLatch.get
 
   /**
    * Add a task to a phase. It doesn't remove previously added tasks.
@@ -257,5 +290,36 @@ final class CoordinatedShutdown private[akka] (
       case None ⇒
         throw new IllegalArgumentException(s"Unknown phase [$phase]. All phases must be defined in configuration")
     }
+
+  /**
+   * Sum of timeouts of all phases that have some task.
+   */
+  def totalTimeout(): FiniteDuration = {
+    import scala.collection.JavaConverters._
+    tasks.keySet.asScala.foldLeft(Duration.Zero) {
+      case (acc, phase) ⇒ acc + timeout(phase)
+    }
+  }
+
+  /**
+   * Add a JVM shutdown hook that will be run when the JVM process
+   * begins its shutdown sequence. Added hooks may run in an order
+   * concurrently, but they are running before Akka internal shutdown
+   * hooks, e.g. those shutting down Artery.
+   */
+  @tailrec def addJvmShutdownHook(hook: () ⇒ Unit): Unit = {
+    if (!runStarted.get) {
+      val currentLatch = _jvmHooksLatch.get
+      val newLatch = new CountDownLatch(currentLatch.getCount.toInt + 1)
+      if (_jvmHooksLatch.compareAndSet(currentLatch, newLatch)) {
+        Runtime.getRuntime.addShutdownHook(new Thread {
+          override def run(): Unit = {
+            try hook() finally _jvmHooksLatch.get.countDown()
+          }
+        })
+      } else
+        addJvmShutdownHook(hook) // lost CAS, retry
+    }
+  }
 
 }
