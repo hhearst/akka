@@ -92,7 +92,7 @@ class ClusterSingletonRestartSpec extends AkkaSpec("""
 
       Cluster(sys2).leave(Cluster(sys2).selfAddress)
 
-      within(10.seconds) {
+      within(15.seconds) {
         awaitAssert {
           Cluster(sys3).state.members.map(_.uniqueAddress) should ===(Set(Cluster(sys3).selfUniqueAddress))
         }
