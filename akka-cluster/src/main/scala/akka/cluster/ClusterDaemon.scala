@@ -179,7 +179,7 @@ private[cluster] final class ClusterDaemon(settings: ClusterSettings) extends Ac
 
   val clusterShutdown = Promise[Done]()
   val coordShutdown = CoordinatedShutdown(context.system)
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterLeave) {
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterLeave, "leave") {
     val sys = context.system
     () ⇒
       if (Cluster(sys).isTerminated)
@@ -189,7 +189,7 @@ private[cluster] final class ClusterDaemon(settings: ClusterSettings) extends Ac
         self.ask(CoordinatedShutdownLeave.LeaveReq).mapTo[Done]
       }
   }
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterShutdown) { () ⇒
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterShutdown, "wait-shutdown") { () ⇒
     clusterShutdown.future
   }
 
@@ -306,10 +306,10 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   var exitingTasksInProgress = false
   val selfExiting = Promise[Done]()
   val coordShutdown = CoordinatedShutdown(context.system)
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting, "wait-exiting") { () ⇒
     selfExiting.future
   }
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExitingDone) {
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExitingDone, "exiting-completed") {
     val sys = context.system
     () ⇒
       if (Cluster(sys).isTerminated)

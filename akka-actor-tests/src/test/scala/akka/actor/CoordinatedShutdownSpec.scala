@@ -111,15 +111,15 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         "b" → phase("a"),
         "c" → phase("b", "a"))
       val co = new CoordinatedShutdown(extSys, phases)
-      co.addTask("a") { () ⇒
+      co.addTask("a", "a1") { () ⇒
         testActor ! "A"
         Future.successful(Done)
       }
-      co.addTask("b") { () ⇒
+      co.addTask("b", "b1") { () ⇒
         testActor ! "B"
         Future.successful(Done)
       }
-      co.addTask("b") { () ⇒
+      co.addTask("b", "b2") { () ⇒
         Future {
           // to verify that c is not performed before b
           Thread.sleep(100)
@@ -127,7 +127,7 @@ class CoordinatedShutdownSpec extends AkkaSpec {
           Done
         }
       }
-      co.addTask("c") { () ⇒
+      co.addTask("c", "c1") { () ⇒
         testActor ! "C"
         Future.successful(Done)
       }
@@ -139,7 +139,7 @@ class CoordinatedShutdownSpec extends AkkaSpec {
       import system.dispatcher
       val phases = Map("a" → emptyPhase)
       val co = new CoordinatedShutdown(extSys, phases)
-      co.addTask("a") { () ⇒
+      co.addTask("a", "a1") { () ⇒
         testActor ! "A"
         Future.successful(Done)
       }
@@ -157,11 +157,11 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         "b" → Phase(dependsOn = Set("a"), timeout = 100.millis, recover = true),
         "c" → phase("b", "a"))
       val co = new CoordinatedShutdown(extSys, phases)
-      co.addTask("a") { () ⇒
+      co.addTask("a", "a1") { () ⇒
         testActor ! "A"
         Future.failed(new RuntimeException("boom"))
       }
-      co.addTask("a") { () ⇒
+      co.addTask("a", "a2") { () ⇒
         Future {
           // to verify that b is not performed before a also in case of failure
           Thread.sleep(100)
@@ -169,11 +169,11 @@ class CoordinatedShutdownSpec extends AkkaSpec {
           Done
         }
       }
-      co.addTask("b") { () ⇒
+      co.addTask("b", "b1") { () ⇒
         testActor ! "B"
         Promise[Done]().future // never completed
       }
-      co.addTask("c") { () ⇒
+      co.addTask("c", "c1") { () ⇒
         testActor ! "C"
         Future.successful(Done)
       }
@@ -190,11 +190,11 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         "b" → Phase(dependsOn = Set("a"), timeout = 100.millis, recover = false),
         "c" → phase("b", "a"))
       val co = new CoordinatedShutdown(extSys, phases)
-      co.addTask("b") { () ⇒
+      co.addTask("b", "b1") { () ⇒
         testActor ! "B"
         Promise[Done]().future // never completed
       }
-      co.addTask("c") { () ⇒
+      co.addTask("c", "c1") { () ⇒
         testActor ! "C"
         Future.successful(Done)
       }
@@ -212,9 +212,9 @@ class CoordinatedShutdownSpec extends AkkaSpec {
         "a" → emptyPhase,
         "b" → phase("a"))
       val co = new CoordinatedShutdown(extSys, phases)
-      co.addTask("a") { () ⇒
+      co.addTask("a", "a1") { () ⇒
         testActor ! "A"
-        co.addTask("b") { () ⇒
+        co.addTask("b", "b1") { () ⇒
           testActor ! "B"
           Future.successful(Done)
         }

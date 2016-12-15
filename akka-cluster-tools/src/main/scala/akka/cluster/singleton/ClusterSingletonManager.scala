@@ -249,7 +249,7 @@ object ClusterSingletonManager {
         // Using PhaseClusterExiting in the singleton because the graceful shutdown of sharding region
         // should preferably complete before stopping the singleton sharding coordinator on same node.
         val coordShutdown = CoordinatedShutdown(context.system)
-        coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
+        coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting, "singleton-exiting-1") { () ⇒
           implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExiting))
           self.ask(SelfExiting).mapTo[Done]
         }
@@ -461,9 +461,9 @@ class ClusterSingletonManager(
   // for CoordinatedShutdown
   val coordShutdown = CoordinatedShutdown(context.system)
   val memberExitingProgress = Promise[Done]()
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting)(() ⇒
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting, "wait-singleton-exiting")(() ⇒
     memberExitingProgress.future)
-  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
+  coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting, "singleton-exiting-2") { () ⇒
     implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExiting))
     self.ask(SelfExiting).mapTo[Done]
   }

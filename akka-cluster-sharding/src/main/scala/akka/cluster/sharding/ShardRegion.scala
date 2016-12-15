@@ -31,12 +31,12 @@ object ShardRegion {
    * Factory method for the [[akka.actor.Props]] of the [[ShardRegion]] actor.
    */
   private[akka] def props(
-    typeName:           String,
-    entityProps:        Props,
-    settings:           ClusterShardingSettings,
-    coordinatorPath:    String,
-    extractEntityId:    ShardRegion.ExtractEntityId,
-    extractShardId:     ShardRegion.ExtractShardId,
+    typeName: String,
+    entityProps: Props,
+    settings: ClusterShardingSettings,
+    coordinatorPath: String,
+    extractEntityId: ShardRegion.ExtractEntityId,
+    extractShardId: ShardRegion.ExtractShardId,
     handOffStopMessage: Any): Props =
     Props(new ShardRegion(typeName, Some(entityProps), settings, coordinatorPath, extractEntityId,
       extractShardId, handOffStopMessage)).withDeploy(Deploy.local)
@@ -47,11 +47,11 @@ object ShardRegion {
    * when using it in proxy only mode.
    */
   private[akka] def proxyProps(
-    typeName:        String,
-    settings:        ClusterShardingSettings,
+    typeName: String,
+    settings: ClusterShardingSettings,
     coordinatorPath: String,
     extractEntityId: ShardRegion.ExtractEntityId,
-    extractShardId:  ShardRegion.ExtractShardId): Props =
+    extractShardId: ShardRegion.ExtractShardId): Props =
     Props(new ShardRegion(typeName, None, settings, coordinatorPath, extractEntityId, extractShardId, PoisonPill))
       .withDeploy(Deploy.local)
 
@@ -339,12 +339,12 @@ object ShardRegion {
  * @see [[ClusterSharding$ ClusterSharding extension]]
  */
 class ShardRegion(
-  typeName:           String,
-  entityProps:        Option[Props],
-  settings:           ClusterShardingSettings,
-  coordinatorPath:    String,
-  extractEntityId:    ShardRegion.ExtractEntityId,
-  extractShardId:     ShardRegion.ExtractShardId,
+  typeName: String,
+  entityProps: Option[Props],
+  settings: ClusterShardingSettings,
+  coordinatorPath: String,
+  extractEntityId: ShardRegion.ExtractEntityId,
+  extractShardId: ShardRegion.ExtractShardId,
   handOffStopMessage: Any) extends Actor with ActorLogging {
 
   import ShardCoordinator.Internal._
@@ -376,10 +376,11 @@ class ShardRegion(
 
   // for CoordinatedShutdown
   val gracefulShutdownProgress = Promise[Done]()
-  CoordinatedShutdown(context.system).addTask(CoordinatedShutdown.PhaseClusterShardingShutdownRegion) { () ⇒
-    self ! GracefulShutdown
-    gracefulShutdownProgress.future
-  }
+  CoordinatedShutdown(context.system).addTask(CoordinatedShutdown.PhaseClusterShardingShutdownRegion,
+    "region-shutdown") { () ⇒
+      self ! GracefulShutdown
+      gracefulShutdownProgress.future
+    }
 
   // subscribe to MemberEvent, re-subscribe when restart
   override def preStart(): Unit = {

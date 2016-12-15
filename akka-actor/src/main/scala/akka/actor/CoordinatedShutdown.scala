@@ -55,7 +55,7 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
     val terminateActorSystem = conf.getBoolean("terminate-actor-system")
     val exitJvm = conf.getBoolean("exit-jvm")
     if (terminateActorSystem || exitJvm) {
-      coord.addTask(PhaseActorSystemTerminate) { () ⇒
+      coord.addTask(PhaseActorSystemTerminate, "terminate-system") { () ⇒
         if (exitJvm && terminateActorSystem) {
           // In case ActorSystem shutdown takes longer than the phase timeout,
           // exit the JVM forcefully anyway.
@@ -177,7 +177,7 @@ final class CoordinatedShutdown private[akka] (
   private[akka] val log = Logging(system, getClass)
   private val knownPhases = phases.keySet ++ phases.values.flatMap(_.dependsOn)
   private val orderedPhases = CoordinatedShutdown.topologicalSort(phases)
-  private val tasks = new ConcurrentHashMap[String, Vector[() ⇒ Future[Done]]]
+  private val tasks = new ConcurrentHashMap[String, Vector[(String, () ⇒ Future[Done])]]
   private val runStarted = new AtomicBoolean(false)
   private val runPromise = Promise[Done]()
 
@@ -200,18 +200,18 @@ final class CoordinatedShutdown private[akka] (
    * It is possible to add a task to a later phase by a task in an earlier phase
    * and it will be performed.
    */
-  @tailrec def addTask(phase: String)(task: () ⇒ Future[Done]): Unit = {
+  @tailrec def addTask(phase: String, taskName: String)(task: () ⇒ Future[Done]): Unit = {
     require(
       knownPhases(phase),
       s"Unknown phase [$phase], known phases [$knownPhases]. " +
         "All phases (along with their optional dependencies) must be defined in configuration")
     val current = tasks.get(phase)
     if (current == null) {
-      if (tasks.putIfAbsent(phase, Vector(task)) != null)
-        addTask(phase)(task) // CAS failed, retry
+      if (tasks.putIfAbsent(phase, Vector(taskName → task)) != null)
+        addTask(phase, taskName)(task) // CAS failed, retry
     } else {
-      if (!tasks.replace(phase, current, current :+ task))
-        addTask(phase)(task) // CAS failed, retry
+      if (!tasks.replace(phase, current, current :+ (taskName → task)))
+        addTask(phase, taskName)(task) // CAS failed, retry
     }
   }
 
@@ -228,27 +228,30 @@ final class CoordinatedShutdown private[akka] (
                 if (debugEnabled) log.debug("Performing phase [{}] with [0] tasks", phase)
                 Future.successful(Done)
               case tasks ⇒
-                if (debugEnabled) log.debug("Performing phase [{}] with [{}] tasks", phase, tasks.size)
+                if (debugEnabled) log.debug(
+                  "Performing phase [{}] with [{}] tasks: [{}]",
+                  phase, tasks.size, tasks.map { case (taskName, _) ⇒ taskName }.mkString(", "))
                 // note that tasks within same phase are performed in parallel
                 val recoverEnabled = phases(phase).recover
-                val result = Future.sequence(tasks.map { task ⇒
-                  try {
-                    val r = task.apply()
-                    if (recoverEnabled) r.recover {
+                val result = Future.sequence(tasks.map {
+                  case (taskName, task) ⇒
+                    try {
+                      val r = task.apply()
+                      if (recoverEnabled) r.recover {
+                        case NonFatal(e) ⇒
+                          log.warning("Task [{}] failed in phase [{}]: {}", taskName, phase, e.getMessage)
+                          Done
+                      }
+                      else r
+                    } catch {
                       case NonFatal(e) ⇒
-                        log.warning("Task failed in phase [{}]: {}", phase, e.getMessage)
-                        Done
+                        // in case task.apply throws
+                        if (recoverEnabled) {
+                          log.warning("Task [{}] failed in phase [{}]: {}", taskName, phase, e.getMessage)
+                          Future.successful(Done)
+                        } else
+                          Future.failed(e)
                     }
-                    else r
-                  } catch {
-                    case NonFatal(e) ⇒
-                      // in case task.apply throws
-                      if (recoverEnabled) {
-                        log.warning("Task failed in phase [{}]: {}", phase, e.getMessage)
-                        Future.successful(Done)
-                      } else
-                        Future.failed(e)
-                  }
                 }).map(_ ⇒ Done)(ExecutionContexts.sameThreadExecutionContext)
                 val timeout = phases(phase).timeout
                 val deadline = Deadline.now + timeout
