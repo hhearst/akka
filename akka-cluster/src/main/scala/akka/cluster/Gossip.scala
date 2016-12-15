@@ -187,7 +187,7 @@ private[cluster] final case class Gossip(
   def roleLeader(role: String, selfUniqueAddress: UniqueAddress): Option[UniqueAddress] =
     leaderOf(members.filter(_.hasRole(role)), selfUniqueAddress)
 
-  private def leaderOf(mbrs: immutable.SortedSet[Member], selfUniqueAddress: UniqueAddress): Option[UniqueAddress] = {
+  def leaderOf(mbrs: immutable.SortedSet[Member], selfUniqueAddress: UniqueAddress): Option[UniqueAddress] = {
     val reachableMembers =
       if (overview.reachability.isAllReachable) mbrs.filterNot(_.status == Down)
       else mbrs.filter(m ⇒ m.status != Down &&

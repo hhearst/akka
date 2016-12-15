@@ -13,6 +13,7 @@ import akka.cluster.ClusterEvent._
 import akka.cluster.MemberStatus._
 import akka.event.EventStream
 import akka.dispatch.{ UnboundedMessageQueueSemantics, RequiresMessageQueue }
+import akka.actor.DeadLetterSuppression
 
 /**
  * Domain events published to the event bus.
@@ -199,7 +200,7 @@ object ClusterEvent {
    * This event is published when the cluster node is shutting down,
    * before the final [[MemberRemoved]] events are published.
    */
-  final case object ClusterShuttingDown extends ClusterDomainEvent
+  final case object ClusterShuttingDown extends ClusterDomainEvent with DeadLetterSuppression
 
   /**
    * Java API: get the singleton instance of `ClusterShuttingDown` event

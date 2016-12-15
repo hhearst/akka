@@ -112,6 +112,8 @@ private[cluster] object InternalClusterAction {
   @SerialVersionUID(1L)
   final case class InitJoinNack(address: Address) extends ClusterMessage with DeadLetterSuppression
 
+  final case class ExitingConfirmed(node: UniqueAddress) extends ClusterMessage with DeadLetterSuppression
+
   /**
    * Marker interface for periodic tick messages
    */
@@ -144,8 +146,10 @@ private[cluster] object InternalClusterAction {
   final case class AddOnMemberRemovedListener(callback: Runnable) extends NoSerializationVerificationNeeded
 
   sealed trait SubscriptionMessage
-  final case class Subscribe(subscriber: ActorRef, initialStateMode: SubscriptionInitialStateMode, to: Set[Class[_]]) extends SubscriptionMessage
-  final case class Unsubscribe(subscriber: ActorRef, to: Option[Class[_]]) extends SubscriptionMessage
+  final case class Subscribe(subscriber: ActorRef, initialStateMode: SubscriptionInitialStateMode,
+                             to: Set[Class[_]]) extends SubscriptionMessage
+  final case class Unsubscribe(subscriber: ActorRef, to: Option[Class[_]])
+    extends SubscriptionMessage with DeadLetterSuppression
   /**
    * @param receiver [[akka.cluster.ClusterEvent.CurrentClusterState]] will be sent to the `receiver`
    */
@@ -315,6 +319,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
         self.ask(ExitingCompleted).mapTo[Done]
       }
   }
+  var exitingConfirmed = Set.empty[UniqueAddress]
 
   /**
    * Looks up and returns the remote cluster command connection for the specific address.
@@ -435,6 +440,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       logInfo(
         "Trying to join seed nodes [{}] when already part of a cluster, ignoring",
         seedNodes.mkString(", "))
+    case ExitingConfirmed(address) ⇒ receiveExitingConfirmed(address)
   }: Actor.Receive).orElse(receiveExitingCompleted)
 
   def receiveExitingCompleted: Actor.Receive = {
@@ -446,10 +452,11 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
   def receive = uninitialized
 
   override def unhandled(message: Any): Unit = message match {
-    case _: Tick           ⇒
-    case _: GossipEnvelope ⇒
-    case _: GossipStatus   ⇒
-    case other             ⇒ super.unhandled(other)
+    case _: Tick             ⇒
+    case _: GossipEnvelope   ⇒
+    case _: GossipStatus     ⇒
+    case _: ExitingConfirmed ⇒
+    case other               ⇒ super.unhandled(other)
   }
 
   def initJoin(): Unit = {
@@ -650,7 +657,31 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
     // alright to require the downing, because that is probably caused by a
     // network failure anyway.
     gossipRandomN(NumberOfGossipsBeforeShutdownWhenLeaderExits)
+
+    // send ExitingConfirmed to two potential leaders
+    latestGossip.leaderOf(latestGossip.members, selfUniqueAddress) match {
+      case Some(node1) ⇒
+        clusterCore(node1.address) ! ExitingConfirmed(selfUniqueAddress)
+        latestGossip.leaderOf(latestGossip.members.filterNot(_.uniqueAddress == node1), selfUniqueAddress) match {
+          case Some(node2) ⇒
+            clusterCore(node2.address) ! ExitingConfirmed(selfUniqueAddress)
+          case None ⇒ // no more potential leader
+        }
+      case None ⇒ // no leader
+    }
+
     shutdown()
+  }
+
+  def receiveExitingConfirmed(node: UniqueAddress): Unit = {
+    logInfo("Exiting confirmed [{}]", node.address)
+    exitingConfirmed += node
+  }
+
+  def cleanupExitingConfirmed(): Unit = {
+    // in case the actual removal was performed by another leader node we
+    if (exitingConfirmed.nonEmpty)
+      exitingConfirmed = exitingConfirmed.filter(n ⇒ latestGossip.members.exists(_.uniqueAddress == n))
   }
 
   /**
@@ -974,6 +1005,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
               s"${m.address} ${m.status} seen=${latestGossip.seenByNode(m.uniqueAddress)}").mkString(", "))
       }
     }
+    cleanupExitingConfirmed()
     shutdownSelfWhenDown()
   }
 
@@ -1029,6 +1061,8 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       if Gossip.removeUnreachableWithMemberStatus(m.status)
     } yield m
 
+    val removedExitingConfirmed = exitingConfirmed.filter(n ⇒ localGossip.member(n).status == Exiting)
+
     val changedMembers = localMembers collect {
       var upNumber = 0
 
@@ -1052,14 +1086,15 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       }
     }
 
-    if (removedUnreachable.nonEmpty || changedMembers.nonEmpty) {
+    if (removedUnreachable.nonEmpty || removedExitingConfirmed.nonEmpty || changedMembers.nonEmpty) {
       // handle changes
 
       // replace changed members
-      val newMembers = changedMembers union localMembers diff removedUnreachable
+      val newMembers = changedMembers.union(localMembers).diff(removedUnreachable)
+        .filterNot(m ⇒ removedExitingConfirmed(m.uniqueAddress))
 
       // removing REMOVED nodes from the `seen` table
-      val removed = removedUnreachable.map(_.uniqueAddress)
+      val removed = removedUnreachable.map(_.uniqueAddress).union(removedExitingConfirmed)
       val newSeen = localSeen diff removed
       // removing REMOVED nodes from the `reachability` table
       val newReachability = localOverview.reachability.remove(removed)
@@ -1084,6 +1119,7 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       }
 
       updateLatestGossip(newGossip)
+      exitingConfirmed = exitingConfirmed.filterNot(removedExitingConfirmed)
 
       // log status changes
       changedMembers foreach { m ⇒
@@ -1094,6 +1130,9 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
       removedUnreachable foreach { m ⇒
         val status = if (m.status == Exiting) "exiting" else "unreachable"
         logInfo("Leader is removing {} node [{}]", status, m.address)
+      }
+      removedExitingConfirmed.foreach { n ⇒
+        logInfo("Leader is removing confirmed Exiting node [{}]", n.address)
       }
 
       publish(latestGossip)
