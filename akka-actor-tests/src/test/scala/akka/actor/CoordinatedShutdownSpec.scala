@@ -227,7 +227,7 @@ class CoordinatedShutdownSpec extends AkkaSpec {
 
     "parse phases from config" in {
       CoordinatedShutdown.phasesFromConfig(ConfigFactory.parseString("""
-        default-timeout = 10s
+        default-phase-timeout = 10s
         phases {
           a = {}
           b {

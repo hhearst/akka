@@ -116,10 +116,10 @@ object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with Extensi
    */
   private[akka] def phasesFromConfig(conf: Config): Map[String, Phase] = {
     import scala.collection.JavaConverters._
-    val defaultTimeout = conf.getString("default-timeout")
+    val defaultPhaseTimeout = conf.getString("default-phase-timeout")
     val phasesConf = conf.getConfig("phases")
     val defaultPhaseConfig = ConfigFactory.parseString(s"""
-      timeout = $defaultTimeout
+      timeout = $defaultPhaseTimeout
       recover = true
       depends-on = []
     """)
