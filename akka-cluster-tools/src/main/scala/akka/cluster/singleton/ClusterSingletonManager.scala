@@ -242,6 +242,12 @@ object ClusterSingletonManager {
       // subscribe to MemberEvent, re-subscribe when restart
       override def preStart(): Unit = {
         cluster.subscribe(self, classOf[MemberEvent])
+
+        // It'ss a delicate difference between oordinatedShutdown.PhaseClusterExiting and MemberExited.
+        // MemberExited event is published immediately (leader may have performed that transition on other node),
+        // and that will trigger run of CoordinatedShutdown, while PhaseClusterExiting will happen later.
+        // Using PhaseClusterExiting in the singleton because the graceful shutdown of sharding region
+        // should preferably complete before stopping the singleton sharding coordinator on same node.
         val coordShutdown = CoordinatedShutdown(context.system)
         coordShutdown.addTask(CoordinatedShutdown.PhaseClusterExiting) { () ⇒
           implicit val timeout = Timeout(coordShutdown.timeout(CoordinatedShutdown.PhaseClusterExiting))
