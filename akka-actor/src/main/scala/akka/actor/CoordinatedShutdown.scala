@@ -34,6 +34,12 @@ import java.util.concurrent.CompletionStage
 import java.util.Optional
 
 object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with ExtensionIdProvider {
+  val PhaseCustom1 = "custom-1"
+  val PhaseCustom2 = "custom-2"
+  val PhaseCustom3 = "custom-3"
+  val PhaseServiceUnbind = "service-unbind"
+  val PhaseServiceRequestsDone = "service-requests-done"
+  val PhaseServiceStop = "service-stop"
   val PhaseClusterLeave = "cluster-leave"
   val PhaseClusterShardingShutdownRegion = "cluster-sharding-shutdown-region"
   val PhaseClusterExiting = "cluster-exiting"
@@ -181,7 +187,8 @@ final class CoordinatedShutdown private[akka] (
   /** INTERNAL API */
   private[akka] val log = Logging(system, getClass)
   private val knownPhases = phases.keySet ++ phases.values.flatMap(_.dependsOn)
-  private val orderedPhases = CoordinatedShutdown.topologicalSort(phases)
+  /** INTERNAL API */
+  private[akka] val orderedPhases = CoordinatedShutdown.topologicalSort(phases)
   private val tasks = new ConcurrentHashMap[String, Vector[(String, () ⇒ Future[Done])]]
   private val runStarted = new AtomicBoolean(false)
   private val runPromise = Promise[Done]()
@@ -239,6 +246,8 @@ final class CoordinatedShutdown private[akka] (
    * Scala API: Run tasks of all phases. The returned
    * `Future` is completed when all tasks have been completed,
    * or there is a failure when recovery is disabled.
+   *
+   * It's safe to call this method multiple times. It will only run the once.
    */
   def run(): Future[Done] = run(None)
 
@@ -246,6 +255,8 @@ final class CoordinatedShutdown private[akka] (
    * Java API: Run tasks of all phases. The returned
    * `CompletionStage` is completed when all tasks have been completed,
    * or there is a failure when recovery is disabled.
+   *
+   * It's safe to call this method multiple times. It will only run the once.
    */
   def runAll(): CompletionStage[Done] = run().toJava
 
@@ -253,6 +264,8 @@ final class CoordinatedShutdown private[akka] (
    * Scala API: Run tasks of all phases including and after the given phase.
    * The returned `Future` is completed when all such tasks have been completed,
    * or there is a failure when recovery is disabled.
+   *
+   * It's safe to call this method multiple times. It will only run the once.
    */
   def run(fromPhase: Option[String]): Future[Done] = {
     if (runStarted.compareAndSet(false, true)) {
@@ -330,6 +343,8 @@ final class CoordinatedShutdown private[akka] (
    * Java API: Run tasks of all phases including and after the given phase.
    * The returned `CompletionStage` is completed when all such tasks have been completed,
    * or there is a failure when recovery is disabled.
+   *
+   * It's safe to call this method multiple times. It will only run the once.
    */
   def run(fromPhase: Optional[String]): CompletionStage[Done] =
     run(fromPhase.asScala).toJava

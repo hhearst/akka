@@ -104,6 +104,23 @@ class CoordinatedShutdownSpec extends AkkaSpec {
 
     }
 
+    "have pre-defined phases from config" in {
+      import CoordinatedShutdown._
+      CoordinatedShutdown(system).orderedPhases should ===(List(
+        PhaseCustom1,
+        PhaseServiceUnbind,
+        PhaseServiceRequestsDone,
+        PhaseServiceStop,
+        PhaseCustom2,
+        PhaseClusterShardingShutdownRegion,
+        PhaseClusterLeave,
+        PhaseClusterExiting,
+        PhaseClusterExitingDone,
+        PhaseClusterShutdown,
+        PhaseCustom3,
+        PhaseActorSystemTerminate))
+    }
+
     "run ordered phases" in {
       import system.dispatcher
       val phases = Map(
