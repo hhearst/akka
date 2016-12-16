@@ -215,7 +215,9 @@ final class CoordinatedShutdown private[akka] (
     }
   }
 
-  def run(): Future[Done] = {
+  def run(): Future[Done] = run(None)
+
+  def run(fromPhase: Option[String]): Future[Done] = {
     if (runStarted.compareAndSet(false, true)) {
       import system.dispatcher
       val debugEnabled = log.isDebugEnabled
@@ -276,7 +278,12 @@ final class CoordinatedShutdown private[akka] (
               phaseResult.flatMap(_ ⇒ loop(remaining))
         }
       }
-      val done = loop(orderedPhases)
+
+      val remainingPhases = fromPhase match {
+        case None    ⇒ orderedPhases // all
+        case Some(p) ⇒ orderedPhases.dropWhile(_ != p)
+      }
+      val done = loop(remainingPhases)
       runPromise.completeWith(done)
     }
     runPromise.future

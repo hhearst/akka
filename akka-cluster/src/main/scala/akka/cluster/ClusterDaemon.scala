@@ -195,6 +195,10 @@ private[cluster] final class ClusterDaemon(settings: ClusterSettings) extends Ac
 
   override def postStop(): Unit = {
     clusterShutdown.trySuccess(Done)
+    if (Cluster(context.system).settings.RunCoordinatedShutdownWhenDown) {
+      // run the last phases e.g. if node was downed (not leaving)
+      coordShutdown.run(Some(CoordinatedShutdown.PhaseClusterShutdown))
+    }
   }
 
   def createChildren(): Unit = {

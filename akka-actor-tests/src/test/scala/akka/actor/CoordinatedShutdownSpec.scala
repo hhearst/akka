@@ -135,6 +135,29 @@ class CoordinatedShutdownSpec extends AkkaSpec {
       receiveN(4) should ===(List("A", "B", "B", "C"))
     }
 
+    "run from a given phase" in {
+      import system.dispatcher
+      val phases = Map(
+        "a" → emptyPhase,
+        "b" → phase("a"),
+        "c" → phase("b", "a"))
+      val co = new CoordinatedShutdown(extSys, phases)
+      co.addTask("a", "a1") { () ⇒
+        testActor ! "A"
+        Future.successful(Done)
+      }
+      co.addTask("b", "b1") { () ⇒
+        testActor ! "B"
+        Future.successful(Done)
+      }
+      co.addTask("c", "c1") { () ⇒
+        testActor ! "C"
+        Future.successful(Done)
+      }
+      Await.result(co.run(Some("b")), remainingOrDefault)
+      receiveN(2) should ===(List("B", "C"))
+    }
+
     "only run once" in {
       import system.dispatcher
       val phases = Map("a" → emptyPhase)

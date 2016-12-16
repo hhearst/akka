@@ -180,10 +180,38 @@ class ClusterSpec extends AkkaSpec(ClusterSpec.config) with ImplicitSender {
         probe.expectMsgType[MemberUp]
 
         Cluster(sys2).leave(Cluster(sys2).selfAddress)
+        probe.expectMsgType[MemberLeft]
+        probe.expectMsgType[MemberExited]
+        probe.expectMsgType[MemberRemoved]
         Await.result(sys2.whenTerminated, 10.seconds)
         Cluster(sys2).isTerminated should ===(true)
       } finally {
         shutdown(sys2)
+      }
+    }
+
+    "terminate ActorSystem via down (CoordinatedShutdown)" in {
+      val sys3 = ActorSystem("ClusterSpec3", ConfigFactory.parseString("""
+        akka.actor.provider = "cluster"
+        akka.remote.netty.tcp.port = 0
+        akka.remote.artery.canonical.port = 0
+        akka.coordinated-shutdown.terminate-actor-system = on
+        akka.cluster.run-coordinated-shutdown-when-down = on
+akka.loglevel=DEBUG
+        """))
+      try {
+        val probe = TestProbe()(sys3)
+        Cluster(sys3).subscribe(probe.ref, classOf[MemberEvent])
+        probe.expectMsgType[CurrentClusterState]
+        Cluster(sys3).join(Cluster(sys3).selfAddress)
+        probe.expectMsgType[MemberUp]
+
+        Cluster(sys3).down(Cluster(sys3).selfAddress)
+        probe.expectMsgType[MemberRemoved]
+        Await.result(sys3.whenTerminated, 10.seconds)
+        Cluster(sys3).isTerminated should ===(true)
+      } finally {
+        shutdown(sys3)
       }
     }
   }
