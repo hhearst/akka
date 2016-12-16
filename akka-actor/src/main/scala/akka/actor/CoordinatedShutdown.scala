@@ -4,6 +4,8 @@
 package akka.actor
 
 import scala.concurrent.duration._
+import scala.compat.java8.FutureConverters._
+import scala.compat.java8.OptionConverters._
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit.MILLISECONDS
@@ -27,6 +29,9 @@ import scala.util.Try
 import scala.concurrent.Await
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicReference
+import java.util.function.Supplier
+import java.util.concurrent.CompletionStage
+import java.util.Optional
 
 object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with ExtensionIdProvider {
   val PhaseClusterLeave = "cluster-leave"
@@ -189,7 +194,7 @@ final class CoordinatedShutdown private[akka] (
   private[akka] def jvmHooksLatch: CountDownLatch = _jvmHooksLatch.get
 
   /**
-   * Add a task to a phase. It doesn't remove previously added tasks.
+   * Scala API: Add a task to a phase. It doesn't remove previously added tasks.
    * Tasks added to the same phase are executed in parallel without any
    * ordering assumptions. Next phase will not start until all tasks of
    * previous phase have been completed.
@@ -215,8 +220,40 @@ final class CoordinatedShutdown private[akka] (
     }
   }
 
+  /**
+   * Java API: Add a task to a phase. It doesn't remove previously added tasks.
+   * Tasks added to the same phase are executed in parallel without any
+   * ordering assumptions. Next phase will not start until all tasks of
+   * previous phase have been completed.
+   *
+   * Tasks should typically be registered as early as possible after system
+   * startup. When running the coordinated shutdown tasks that have been registered
+   * will be performed but tasks that are added too late will not be run.
+   * It is possible to add a task to a later phase by a task in an earlier phase
+   * and it will be performed.
+   */
+  def addTask(phase: String, taskName: String, task: Supplier[CompletionStage[Done]]): Unit =
+    addTask(phase, taskName)(() ⇒ task.get().toScala)
+
+  /**
+   * Scala API: Run tasks of all phases. The returned
+   * `Future` is completed when all tasks have been completed,
+   * or there is a failure when recovery is disabled.
+   */
   def run(): Future[Done] = run(None)
 
+  /**
+   * Java API: Run tasks of all phases. The returned
+   * `CompletionStage` is completed when all tasks have been completed,
+   * or there is a failure when recovery is disabled.
+   */
+  def runAll(): CompletionStage[Done] = run().toJava
+
+  /**
+   * Scala API: Run tasks of all phases including and after the given phase.
+   * The returned `Future` is completed when all such tasks have been completed,
+   * or there is a failure when recovery is disabled.
+   */
   def run(fromPhase: Option[String]): Future[Done] = {
     if (runStarted.compareAndSet(false, true)) {
       import system.dispatcher
@@ -290,6 +327,14 @@ final class CoordinatedShutdown private[akka] (
   }
 
   /**
+   * Java API: Run tasks of all phases including and after the given phase.
+   * The returned `CompletionStage` is completed when all such tasks have been completed,
+   * or there is a failure when recovery is disabled.
+   */
+  def run(fromPhase: Optional[String]): CompletionStage[Done] =
+    run(fromPhase.asScala).toJava
+
+  /**
    * The configured timeout for a given `phase`.
    * For example useful as timeout when actor `ask` requests
    * is used as a task.
@@ -312,7 +357,7 @@ final class CoordinatedShutdown private[akka] (
   }
 
   /**
-   * Add a JVM shutdown hook that will be run when the JVM process
+   * Scala API: Add a JVM shutdown hook that will be run when the JVM process
    * begins its shutdown sequence. Added hooks may run in an order
    * concurrently, but they are running before Akka internal shutdown
    * hooks, e.g. those shutting down Artery.
@@ -331,5 +376,14 @@ final class CoordinatedShutdown private[akka] (
         addJvmShutdownHook(hook) // lost CAS, retry
     }
   }
+
+  /**
+   * Java API: Add a JVM shutdown hook that will be run when the JVM process
+   * begins its shutdown sequence. Added hooks may run in an order
+   * concurrently, but they are running before Akka internal shutdown
+   * hooks, e.g. those shutting down Artery.
+   */
+  def addJvmShutdownHook(hook: Runnable): Unit =
+    addJvmShutdownHook(() ⇒ hook.run())
 
 }
