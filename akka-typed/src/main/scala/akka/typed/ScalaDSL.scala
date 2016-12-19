@@ -11,7 +11,7 @@ import akka.util.LineNumbers
  * This object holds several behavior factories and combinators that can be
  * used to construct Behavior instances.
  */
-object ScalaDSL {
+object ScalaDSL extends ScalaProcess {
 
   // FIXME check that all behaviors can cope with not getting PreStart as first message
 

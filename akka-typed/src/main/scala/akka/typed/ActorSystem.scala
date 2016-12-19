@@ -136,6 +136,8 @@ trait ActorSystem[-T] extends ActorRef[T] { this: internal.ActorRefImpl[T] ⇒
    * method.
    */
   def systemActorOf[U](behavior: Behavior[U], name: String, deployment: DeploymentConfig = EmptyDeploymentConfig)(implicit timeout: Timeout): Future[ActorRef[U]]
+
+  def receptionist: ActorRef[patterns.Receptionist.Command] = ???
 }
 
 object ActorSystem {
