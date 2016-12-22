@@ -28,7 +28,7 @@ object ClusterSingletonRestart2Spec {
 }
 
 class ClusterSingletonRestart2Spec extends AkkaSpec("""
-  akka.loglevel = INFO
+  akka.loglevel = DEBUG
   akka.cluster.roles = [singleton]
   akka.actor.provider = akka.cluster.ClusterActorRefProvider
   akka.remote {
@@ -59,7 +59,7 @@ class ClusterSingletonRestart2Spec extends AkkaSpec("""
           settings = ClusterSingletonManagerSettings(from).withRole("singleton")),
         name = "echo")
 
-    within(20.seconds) {
+    within(25.seconds) {
       awaitAssert {
         Cluster(from) join Cluster(to).selfAddress
         Cluster(from).state.members.map(_.uniqueAddress) should contain(Cluster(from).selfUniqueAddress)

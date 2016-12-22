@@ -147,7 +147,7 @@ private[cluster] object InternalClusterAction {
 
   sealed trait SubscriptionMessage
   final case class Subscribe(subscriber: ActorRef, initialStateMode: SubscriptionInitialStateMode,
-                             to: Set[Class[_]]) extends SubscriptionMessage
+    to: Set[Class[_]]) extends SubscriptionMessage
   final case class Unsubscribe(subscriber: ActorRef, to: Option[Class[_]])
     extends SubscriptionMessage with DeadLetterSuppression
   /**
@@ -663,10 +663,11 @@ private[cluster] class ClusterCoreDaemon(publisher: ActorRef) extends Actor with
     gossipRandomN(NumberOfGossipsBeforeShutdownWhenLeaderExits)
 
     // send ExitingConfirmed to two potential leaders
-    latestGossip.leaderOf(latestGossip.members, selfUniqueAddress) match {
+    val membersWithoutSelf = latestGossip.members.filterNot(_.uniqueAddress == selfUniqueAddress)
+    latestGossip.leaderOf(membersWithoutSelf, selfUniqueAddress) match {
       case Some(node1) ⇒
         clusterCore(node1.address) ! ExitingConfirmed(selfUniqueAddress)
-        latestGossip.leaderOf(latestGossip.members.filterNot(_.uniqueAddress == node1), selfUniqueAddress) match {
+        latestGossip.leaderOf(membersWithoutSelf.filterNot(_.uniqueAddress == node1), selfUniqueAddress) match {
           case Some(node2) ⇒
             clusterCore(node2.address) ! ExitingConfirmed(selfUniqueAddress)
           case None ⇒ // no more potential leader
@@ -1466,10 +1467,10 @@ private[cluster] class OnMemberStatusChangedListener(callback: Runnable, status:
 @SerialVersionUID(1L)
 private[cluster] final case class GossipStats(
   receivedGossipCount: Long = 0L,
-  mergeCount:          Long = 0L,
-  sameCount:           Long = 0L,
-  newerCount:          Long = 0L,
-  olderCount:          Long = 0L) {
+  mergeCount: Long = 0L,
+  sameCount: Long = 0L,
+  newerCount: Long = 0L,
+  olderCount: Long = 0L) {
 
   def incrementMergeCount(): GossipStats =
     copy(mergeCount = mergeCount + 1, receivedGossipCount = receivedGossipCount + 1)
@@ -1509,5 +1510,5 @@ private[cluster] final case class GossipStats(
 @SerialVersionUID(1L)
 private[cluster] final case class VectorClockStats(
   versionSize: Int = 0,
-  seenLatest:  Int = 0)
+  seenLatest: Int = 0)
 
