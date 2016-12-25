@@ -18,6 +18,28 @@ object ScalaProcess {
   private implicit def nothingIsSomething[T, U](op: Operation[Nothing, T]): Operation[U, T] = op.asInstanceOf[Operation[U, T]]
 
   /*
+   * Convenient access to the core operations, will be even nicer with Dotty implicit function values
+   */
+  sealed trait OpDSL extends Any {
+    type Self
+  }
+
+  object OpDSL {
+    def apply[T]: Next[T] = next.asInstanceOf[Next[T]]
+
+    trait Next[T] {
+      def apply[U](body: OpDSL { type Self = T } ⇒ Operation[T, U]): Operation[T, U] = body(null)
+    }
+    private object next extends Next[Nothing]
+
+    trait NextStep[T] {
+      def apply[U](body: OpDSL { type Self = T } ⇒ Operation[T, U])(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
+        Call(Process("nextStep", Duration.Inf, body(null)))
+    }
+    private[typed] object nextStep extends NextStep[Nothing]
+  }
+
+  /*
    * Terminology:
    *
    *  - a Process has a 1:1 relationship with an ActorRef
@@ -73,43 +95,132 @@ object ScalaProcess {
   private case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
   private case class Spawn[S](process: Process[S, Any]) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
   private case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, Cancellable]
+  private case class State[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S => Seq[T#Event]) extends Operation[Nothing, S]
+  private case class Replay[T](key: StateKey[T], initial: T) extends Operation[Nothing, T]
+  private case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
 
   case class Process[S, +Out](name: String, timeout: Duration, operation: Operation[S, Out])
 
   /*
    * The core operations: keep these minimal!
    */
-  def system(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorSystem[Nothing]] = System
-  def read(implicit opDSL: OpDSL): Operation[opDSL.Self, opDSL.Self] = Read
-  def processSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[opDSL.Self]] = Self
-  def actorSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Nothing]]] = ActorSelf
-  def unit[U](value: U)(implicit opDSL: OpDSL): Operation[opDSL.Self, U] = Return(value)
-  def call[Self, Out](process: Process[Self, Out])(implicit opDSL: OpDSL): Operation[opDSL.Self, Out] = Call(process)
-  def nextStep[T] = OpDSL.nextStep.asInstanceOf[OpDSL.NextStep[T]]
-  def fork[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, SubActor[Self]] = Fork(process)
-  def spawn[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Self]]] = Spawn(process)
-  def schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, Cancellable] = Schedule(delay, msg, target)
 
-  /*
-   * Convenient access to the core operations, will be even nicer with Dotty implicit function values
+  /**
+   * Obtain a reference to the ActorSystem in which this process is running.
    */
-  sealed trait OpDSL extends Any {
-    type Self
-  }
+  def system(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorSystem[Nothing]] =
+    System
 
-  object OpDSL {
-    def apply[T]: Next[T] = next.asInstanceOf[Next[T]]
+  /**
+   * Read a message from this process’ input channel.
+   */
+  def read(implicit opDSL: OpDSL): Operation[opDSL.Self, opDSL.Self] =
+    Read
 
-    trait Next[T] {
-      def apply[U](body: OpDSL { type Self = T } ⇒ Operation[T, U]): Operation[T, U] = body(null)
-    }
-    private object next extends Next[Nothing]
+  /**
+   * Obtain this process’ [[ActorRef]], not to be confused with the ActorRef of the Actor this process is running in.
+   */
+  def processSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[opDSL.Self]] =
+    Self
 
-    trait NextStep[T] {
-      def apply[U](body: OpDSL { type Self = T } ⇒ Operation[T, U])(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
-        Call(Process("nextStep", Duration.Inf, body(null)))
-    }
-    private[typed] object nextStep extends NextStep[Nothing]
+  /**
+   * Obtain the [[ActorRef]] of the Actor this process is running in.
+   */
+  def actorSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Nothing]]] =
+    ActorSelf
+
+  /**
+   * Lift a plain value into a process that returns that value.
+   */
+  def unit[U](value: U)(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
+    Return(value)
+
+  /**
+   * Execute the given process within the current Actor, await and return that process’ result.
+   */
+  def call[Self, Out](process: Process[Self, Out])(implicit opDSL: OpDSL): Operation[opDSL.Self, Out] =
+    Call(process)
+
+  /**
+   * Create and execute a process with a self reference of the given type,
+   * await and return that process’ result. This is equivalent to creating
+   * a process with [[OpDSL]] and using `call` to execute it.
+   */
+  def nextStep[T] =
+    OpDSL.nextStep.asInstanceOf[OpDSL.NextStep[T]]
+
+  /**
+   * Execute the given process within the current Actor, concurrently with the
+   * current process. The value computed by the forked process cannot be
+   * observed, instead you would have the forked process send a message to the
+   * current process to communicate results. The returned [[SubActor]] reference
+   * can be used to send messages to the forked process or to cancel it.
+   */
+  def fork[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, SubActor[Self]] =
+    Fork(process)
+
+  /**
+   * Execute the given process in a newly spawned child Actor of the current
+   * Actor. The new Actor is fully encapsulated behind the [[ActorRef]] that
+   * is returned.
+   */
+  def spawn[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Self]]] =
+    Spawn(process)
+
+  /**
+   * Schedule a message to be sent after the given delay has elapsed.
+   */
+  def schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, Cancellable] =
+    Schedule(delay, msg, target)
+
+  private val any2Nil = (_: Any) => Nil
+
+  /**
+   * Read the state stored for the given [[StateKey]], suspending this process
+   * until after all outstanding updates for the key have been completed if
+   * `afterUpdates` is `true`.
+   */
+  def readState[T](key: StateKey[T], afterUpdates: Boolean = true)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+    State[T, StateKey[T]](key, afterUpdates, any2Nil)
+
+  /**
+   * Update the state stored for the given [[StateKey]] by emitting events that
+   * are applied to the state in order, suspending this process
+   * until after all outstanding updates for the key have been completed if
+   * `afterUpdates` is `true`.
+   */
+  def updateState[T](key: StateKey[T], afterUpdates: Boolean = true)(
+    transform: T => Seq[key.Event])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+    State(key, afterUpdates, transform)
+
+  /**
+   * Instruct the Actor to persist the state for the given [[StateKey]] after
+   * all currently outstanding updates for this key have been completed,
+   * suspending this process until done.
+   */
+  def takeSnapshot[T](key: StateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+    Snapshot(key)
+
+  /**
+   * Restore the state for the given [[StateKey]] from persistent event storage.
+   * If a snapshot is found it will be used as the starting point for the replay,
+   * otherwise events are replayed from the beginning of the event log, starting
+   * with the given initial data as the state before the first event is applied.
+   */
+  def replayState[T](key: StateKey[T], initial: T)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+    Replay(key, initial)
+
+  /**
+   * A key into the Actor’s state map that allows access both for read and
+   * update operations. Updates are modeled by emitting events of the specified
+   * type. The updates are applied to the state in the order in which they are
+   * emitted. If the Actor is configured to be persistent, then events are
+   * looped through the journal before being applied.
+   */
+  trait StateKey[T] {
+    type Event
+    def clazz: Class[Event]
+    def apply(state: T, event: Event): T
   }
 
   /*
