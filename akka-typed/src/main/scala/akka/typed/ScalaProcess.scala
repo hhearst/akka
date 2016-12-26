@@ -55,16 +55,24 @@ object ScalaProcess {
    *      - recovery means acquiring state initially (which might trigger internal replay)
    */
 
-  // Helper to make map behave like flatMap when needed
+  /**
+   * Helper to make `Operation.map` behave like `flatMap` when needed.
+   */
   trait MapAdapter[Self, Out, Mapped] {
     def lift[O](f: O ⇒ Out): O ⇒ Operation[Self, Mapped]
   }
+  /**
+   * Helper to make `Operation.map` behave like `flatMap` when needed.
+   */
   object MapAdapter extends MapAdapterLow {
     implicit def mapAdapterOperation[Self, M]: MapAdapter[Self, Operation[Self, M], M] =
       new MapAdapter[Self, Operation[Self, M], M] {
         override def lift[O](f: O ⇒ Operation[Self, M]): O ⇒ Operation[Self, M] = f
       }
   }
+  /**
+   * Helper to make `Operation.map` behave like `flatMap` when needed.
+   */
   trait MapAdapterLow {
     implicit def mapAdapterAny[Self, Out]: MapAdapter[Self, Out, Out] =
       new MapAdapter[Self, Out, Out] {
@@ -72,20 +80,68 @@ object ScalaProcess {
       }
   }
 
+  /**
+   * A Process runs the given operation steps in a context that provides the
+   * needed [[ActorRef]] of type `S` as the self-reference. Every process is
+   * allotted a maximum lifetime after which it is canceled; you may set this
+   * to `Duration.Inf` for a server process.
+   */
+  case class Process[S, +Out](name: String, timeout: Duration, operation: Operation[S, Out])
+
+  /**
+   * An Operation is a step executed by a [[Process]]. It exists in a context
+   * characterized by the process’ ActorRef of type `S` and computes
+   * a value of type `Out` when executed.
+   */
   sealed trait Operation[S, +Out] {
+    /**
+     * Execute the given computation and process step after having completed
+     * the current step. The current step’s computed value will be used as
+     * input for the next computation.
+     */
     def flatMap[T](f: Out ⇒ Operation[S, T]): Operation[S, T] = FlatMap(this, f)
+
+    /**
+     * Map the value computed by this process step by the given function,
+     * flattening the result if it is an [[Operation]] (by executing the
+     * operation and using its result as the mapped value).
+     *
+     * The reason behind flattening when possible is to allow the formulation
+     * of infinite process loops (as performed for example by server processes
+     * that respond to any number of requests) using for-comprehensions.
+     * Without this flattening a final pointless `map` step would be added
+     * for each iteration, eventually leading to an OutOfMemoryError.
+     */
     def map[T, Mapped](f: Out ⇒ T)(implicit ev: MapAdapter[S, T, Mapped]): Operation[S, Mapped] = flatMap(ev.lift(f))
+
+    /**
+     * Perform the given side-effect after this process step, continuing with
+     * the `Unit` value.
+     */
     def foreach(f: Out ⇒ Unit): Operation[S, Unit] = flatMap(o ⇒ Return(f(o)))
+
+    /**
+     * Only continue this process if the given predicate is fulfilled, terminate
+     * it otherwise.
+     */
     def filter(p: Out ⇒ Boolean): Operation[S, Out] = flatMap(o ⇒ if (p(o)) Return(o) else ShortCircuit)
+
+    /**
+     * Only continue this process if the given predicate is fulfilled, terminate
+     * it otherwise.
+     */
     def withFilter(p: Out ⇒ Boolean): Operation[S, Out] = flatMap(o ⇒ if (p(o)) Return(o) else ShortCircuit)
   }
 
-  private[this] case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2]
-  private[this] case object ShortCircuit extends Operation[Nothing, Nothing] {
+  /*
+   * These are the private values that make up the core algebra.
+   */
+
+  private case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2]
+  private case object ShortCircuit extends Operation[Nothing, Nothing] {
     override def flatMap[T](f: Nothing ⇒ Operation[Nothing, T]): Operation[Nothing, T] = this
   }
 
-  // these are the private objects, to be obtained via the DSL
   private case object System extends Operation[Nothing, ActorSystem[Nothing]]
   private case object Read extends Operation[Nothing, Nothing]
   private case object Self extends Operation[Nothing, ActorRef[Any]]
@@ -95,11 +151,11 @@ object ScalaProcess {
   private case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
   private case class Spawn[S](process: Process[S, Any]) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
   private case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, Cancellable]
-  private case class State[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S => Seq[T#Event]) extends Operation[Nothing, S]
-  private case class Replay[T](key: StateKey[T], initial: T) extends Operation[Nothing, T]
+  private case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
   private case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
-
-  case class Process[S, +Out](name: String, timeout: Duration, operation: Operation[S, Out])
+  private case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
+  private case class StateR[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S ⇒ Seq[T#Event]) extends Operation[Nothing, S]
+  private case class Forget[T](key: StateKey[T]) extends Operation[Nothing, akka.Done]
 
   /*
    * The core operations: keep these minimal!
@@ -173,7 +229,8 @@ object ScalaProcess {
   def schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, Cancellable] =
     Schedule(delay, msg, target)
 
-  private val any2Nil = (_: Any) => Nil
+  private val _any2Nil = (state: Any) ⇒ Nil → state
+  private def any2Nil[T] = _any2Nil.asInstanceOf[T ⇒ (Nil.type, T)]
 
   /**
    * Read the state stored for the given [[StateKey]], suspending this process
@@ -181,7 +238,7 @@ object ScalaProcess {
    * `afterUpdates` is `true`.
    */
   def readState[T](key: StateKey[T], afterUpdates: Boolean = true)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
-    State[T, StateKey[T]](key, afterUpdates, any2Nil)
+    State[T, StateKey[T], T](key, afterUpdates, any2Nil)
 
   /**
    * Update the state stored for the given [[StateKey]] by emitting events that
@@ -189,16 +246,25 @@ object ScalaProcess {
    * until after all outstanding updates for the key have been completed if
    * `afterUpdates` is `true`.
    */
-  def updateState[T](key: StateKey[T], afterUpdates: Boolean = true)(
-    transform: T => Seq[key.Event])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+  def updateState[T, E](key: StateKey[T], afterUpdates: Boolean = true)(
+    transform: T ⇒ (Seq[key.Event], E))(implicit opDSL: OpDSL): Operation[opDSL.Self, E] =
     State(key, afterUpdates, transform)
+
+  /**
+   * Update the state by emitting a sequence of events, returning the updated state. The
+   * process is suspended until after all outstanding updates for the key have been
+   * completed if `afterUpdates` is `true`.
+   */
+  def updateAndReadState[T](key: StateKey[T], afterUpdates: Boolean = true)(
+    transform: T ⇒ Seq[key.Event])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+    StateR(key, afterUpdates, transform)
 
   /**
    * Instruct the Actor to persist the state for the given [[StateKey]] after
    * all currently outstanding updates for this key have been completed,
    * suspending this process until done.
    */
-  def takeSnapshot[T](key: StateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+  def takeSnapshot[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
     Snapshot(key)
 
   /**
@@ -207,20 +273,73 @@ object ScalaProcess {
    * otherwise events are replayed from the beginning of the event log, starting
    * with the given initial data as the state before the first event is applied.
    */
-  def replayState[T](key: StateKey[T], initial: T)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
-    Replay(key, initial)
+  def replayPersistentState[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+    Replay(key)
+
+  /**
+   * Remove the given [[StateKey]] from this Actor’s storage. The slot can be
+   * filled again using `updateState` or `replayPersistentState`.
+   */
+  def forgetState[T](key: StateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, akka.Done] =
+    Forget(key)
+
+  /*
+   * State Management
+   */
 
   /**
    * A key into the Actor’s state map that allows access both for read and
    * update operations. Updates are modeled by emitting events of the specified
    * type. The updates are applied to the state in the order in which they are
-   * emitted. If the Actor is configured to be persistent, then events are
-   * looped through the journal before being applied.
+   * emitted. For persistent state data please refer to `PersistentStateKey`
+   * and for ephemeral non-event-sourced data take a look at `SimpleStateKey`.
    */
-  trait StateKey[T] {
+  sealed trait StateKey[T] {
     type Event
-    def clazz: Class[Event]
     def apply(state: T, event: Event): T
+    def initial: T
+  }
+
+  /**
+   * Event type emitted in conjunction with [[SimpleStateKey]], the only
+   * implementation is [[SetState]].
+   */
+  sealed trait SetStateEvent[T] {
+    def value: T
+  }
+  /**
+   * Event type that instructs the state of a [[SimpleStateKey]] to be
+   * replaced with the given value.
+   */
+  final case class SetState[T](override val value: T) extends SetStateEvent[T] with Seq[SetStateEvent[T]] {
+    def iterator: Iterator[akka.typed.ScalaProcess.SetStateEvent[T]] = Iterator.single(this)
+    def apply(idx: Int): akka.typed.ScalaProcess.SetStateEvent[T] =
+      if (idx == 0) this
+      else throw new IndexOutOfBoundsException
+    def length: Int = 1
+  }
+
+  /**
+   * Use this key for state that shall neither be persistent nor event-sourced.
+   * In effect this turns `updateState` into access to a State monad identified
+   * by this key instance.
+   *
+   * Beware that reference equality is used to identify this key: you should
+   * create the key as a `val` inside a top-level `object`.
+   */
+  final class SimpleStateKey[T](override val initial: T) extends StateKey[T] {
+    type Event = SetStateEvent[T]
+    def apply(state: T, event: SetStateEvent[T]) = event.value
+    override def toString: String = f"SimpleStateKey@$hashCode%08X($initial)"
+  }
+
+  /**
+   * The data for a [[StateKey]] of this kind can be made persistent by
+   * invoking `replayPersistentState`. Persistence is achieved by writing all
+   * emitted events to the Akka Persistence Journal.
+   */
+  trait PersistentStateKey[T] extends StateKey[T] {
+    def clazz: Class[Event]
   }
 
   /*
@@ -228,7 +347,7 @@ object ScalaProcess {
    */
   def firstOf[T](timeout: Duration, processes: Operation[_, T]*)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
     def forkAll(self: ActorRef[T], index: Int = 0,
-                p: List[Operation[_, T]] = processes.toList,
+                p:   List[Operation[_, T]]   = processes.toList,
                 acc: List[SubActor[Nothing]] = Nil)(implicit opDSL: OpDSL { type Self = T }): Operation[T, List[SubActor[Nothing]]] =
       p match {
         case Nil     ⇒ unit(acc)
@@ -278,6 +397,7 @@ object ScalaProcess {
 
   sealed trait ActorCmd[+T]
   case class MainCmd[T](cmd: T) extends ActorCmd[T]
+  private[typed] trait InternalActorCmd[+T] extends ActorCmd[T]
 
   trait SubActor[-T] {
     def ref: ActorRef[T]
