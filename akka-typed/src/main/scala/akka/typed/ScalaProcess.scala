@@ -33,8 +33,8 @@ object ScalaProcess {
     private object next extends Next[Nothing]
 
     trait NextStep[T] {
-      def apply[U](body: OpDSL { type Self = T } ⇒ Operation[T, U])(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
-        Call(Process("nextStep", Duration.Inf, body(null)))
+      def apply[U](mailboxCapacity: Int, body: OpDSL { type Self = T } ⇒ Operation[T, U])(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
+        Call(Process("nextStep", Duration.Inf, mailboxCapacity, body(null)))
     }
     private[typed] object nextStep extends NextStep[Nothing]
   }
@@ -86,7 +86,45 @@ object ScalaProcess {
    * allotted a maximum lifetime after which it is canceled; you may set this
    * to `Duration.Inf` for a server process.
    */
-  case class Process[S, +Out](name: String, timeout: Duration, operation: Operation[S, Out])
+  case class Process[S, +Out](name: String, timeout: Duration, mailboxCapacity: Int, operation: Operation[S, Out]) {
+    /**
+     * Execute the given computation and process step after having completed
+     * the current step. The current step’s computed value will be used as
+     * input for the next computation.
+     */
+    def flatMap[T](f: Out ⇒ Operation[S, T]): Process[S, T] = copy(operation = FlatMap(operation, f))
+
+    /**
+     * Map the value computed by this process step by the given function,
+     * flattening the result if it is an [[Operation]] (by executing the
+     * operation and using its result as the mapped value).
+     *
+     * The reason behind flattening when possible is to allow the formulation
+     * of infinite process loops (as performed for example by server processes
+     * that respond to any number of requests) using for-comprehensions.
+     * Without this flattening a final pointless `map` step would be added
+     * for each iteration, eventually leading to an OutOfMemoryError.
+     */
+    def map[T, Mapped](f: Out ⇒ T)(implicit ev: MapAdapter[S, T, Mapped]): Process[S, Mapped] = flatMap(ev.lift(f))
+
+    /**
+     * Perform the given side-effect after this process step, continuing with
+     * the `Unit` value.
+     */
+    def foreach(f: Out ⇒ Unit): Process[S, Unit] = flatMap(o ⇒ Return(f(o)))
+
+    /**
+     * Only continue this process if the given predicate is fulfilled, terminate
+     * it otherwise.
+     */
+    def filter(p: Out ⇒ Boolean): Process[S, Out] = flatMap(o ⇒ if (p(o)) Return(o) else ShortCircuit)
+
+    /**
+     * Only continue this process if the given predicate is fulfilled, terminate
+     * it otherwise.
+     */
+    def withFilter(p: Out ⇒ Boolean): Process[S, Out] = flatMap(o ⇒ if (p(o)) Return(o) else ShortCircuit)
+  }
 
   /**
    * An Operation is a step executed by a [[Process]]. It exists in a context
@@ -137,25 +175,27 @@ object ScalaProcess {
    * These are the private values that make up the core algebra.
    */
 
-  private case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2]
-  private case object ShortCircuit extends Operation[Nothing, Nothing] {
+  private[typed] case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2]
+  private[typed] case object ShortCircuit extends Operation[Nothing, Nothing] {
     override def flatMap[T](f: Nothing ⇒ Operation[Nothing, T]): Operation[Nothing, T] = this
   }
 
-  private case object System extends Operation[Nothing, ActorSystem[Nothing]]
-  private case object Read extends Operation[Nothing, Nothing]
-  private case object Self extends Operation[Nothing, ActorRef[Any]]
-  private case object ActorSelf extends Operation[Nothing, ActorRef[ActorCmd[Nothing]]]
-  private case class Return[T](value: T) extends Operation[Nothing, T]
-  private case class Call[S, T](process: Process[S, T]) extends Operation[Nothing, T]
-  private case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
-  private case class Spawn[S](process: Process[S, Any]) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
-  private case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, Cancellable]
-  private case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
-  private case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
-  private case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
-  private case class StateR[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S ⇒ Seq[T#Event]) extends Operation[Nothing, S]
-  private case class Forget[T](key: StateKey[T]) extends Operation[Nothing, akka.Done]
+  private[typed] case object System extends Operation[Nothing, ActorSystem[Nothing]]
+  private[typed] case object Read extends Operation[Nothing, Nothing]
+  private[typed] case object Self extends Operation[Nothing, ActorRef[Any]]
+  private[typed] case object ActorSelf extends Operation[Nothing, ActorRef[ActorCmd[Nothing]]]
+  private[typed] case class Return[T](value: T) extends Operation[Nothing, T]
+  private[typed] case class Call[S, T](process: Process[S, T]) extends Operation[Nothing, T]
+  private[typed] case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
+  private[typed] case class Spawn[S](process: Process[S, Any]) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
+  private[typed] case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, Cancellable]
+  private[typed] case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
+  private[typed] case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
+  private[typed] case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
+  private[typed] case class StateR[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S ⇒ Seq[T#Event]) extends Operation[Nothing, S]
+  private[typed] case class Forget[T](key: StateKey[T]) extends Operation[Nothing, akka.Done]
+
+  // FIXME figure out cleanup of external resources after a failure
 
   /*
    * The core operations: keep these minimal!
@@ -345,15 +385,17 @@ object ScalaProcess {
   /*
    * Derived operations
    */
-  def firstOf[T](timeout: Duration, processes: Operation[_, T]*)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
+  def firstOf[T](timeout: Duration, processes: Process[_, T]*)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
     def forkAll(self: ActorRef[T], index: Int = 0,
-                p:   List[Operation[_, T]]   = processes.toList,
+                p: List[Process[_, T]] = processes.toList,
                 acc: List[SubActor[Nothing]] = Nil)(implicit opDSL: OpDSL { type Self = T }): Operation[T, List[SubActor[Nothing]]] =
       p match {
-        case Nil     ⇒ unit(acc)
-        case x :: xs ⇒ fork(Process(index.toString, timeout, x)).map(sub ⇒ forkAll(self, index + 1, xs, sub :: acc))
+        case Nil ⇒ unit(acc)
+        case x :: xs ⇒
+          fork(x.copy(name = index.toString, operation = x.operation.map(x => { self ! x; x })))
+            .map(sub ⇒ forkAll(self, index + 1, xs, sub :: acc))
       }
-    call(Process("firstOf", timeout, OpDSL[T] { implicit opDSL ⇒
+    call(Process("firstOf", timeout, processes.size, OpDSL[T] { implicit opDSL ⇒
       for {
         self ← processSelf
         subs ← forkAll(self)
@@ -373,16 +415,17 @@ object ScalaProcess {
       } yield read
     }
 
+  def delayProcess[T](time: FiniteDuration, value: T): Process[T, T] =
+    Process("delay", time + 1.second, 1, delay(time, value))
+
   def forkAndCancel[T](timeout: FiniteDuration, process: Process[T, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, SubActor[T]] =
     for {
       sub ← fork(process)
-      _ ← fork(Process("cancelAfter", Duration.Inf, delay(timeout, ()).foreach(_ ⇒ sub.cancel())))
+      _ ← fork(Process("cancelAfter", Duration.Inf, 1, delay(timeout, ()).foreach(_ ⇒ sub.cancel())))
     } yield unit(sub)
 
-  def retry[S, T](timeout: FiniteDuration, retries: Int, ops: Operation[S, T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
-    call(Process("retry", Duration.Inf,
-      firstOf(Duration.Inf, ops.map(Some(_)), delay(timeout, None))
-    ))
+  def retry[S, T](timeout: FiniteDuration, retries: Int, ops: Process[S, T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
+    firstOf(Duration.Inf, ops.map(Some(_)), delayProcess(timeout, None))
       .map {
         case Some(res)           ⇒ unit(res)
         case None if retries > 0 ⇒ retry(timeout, retries - 1, ops)

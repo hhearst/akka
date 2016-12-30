@@ -58,12 +58,12 @@ class ProcessSpec extends TypedSpec {
             self ← processSelf
             _ ← unit(backend ! Login(self))
             AuthSuccess(store) ← read
-            data ← nextStep[DataResult] { implicit opDSL ⇒
+            data ← nextStep[DataResult](1, { implicit opDSL ⇒
               for {
                 self ← processSelf
                 _ = store ! GetData(self)
               } yield read
-            }
+            })
           } req.replyTo ! Response(data.msg)
         }
 
@@ -71,7 +71,7 @@ class ProcessSpec extends TypedSpec {
         OpDSL[Request] { implicit opDSL ⇒
           for {
             req ← read
-            _ ← forkAndCancel(5.seconds, Process("worker", 10.seconds, talkWithBackend(backend, req)))
+            _ ← forkAndCancel(5.seconds, Process("worker", 10.seconds, 1, talkWithBackend(backend, req)))
           } yield loop(backend)
         }
 
@@ -79,8 +79,8 @@ class ProcessSpec extends TypedSpec {
         OpDSL[Request] { implicit op ⇒
           for {
             self ← processSelf
-            _ ← retry(1.second, 3, register(self))
-            backend ← retry(1.second, 3, getBackend)
+            _ ← retry(1.second, 3, Process("register", Duration.Inf, 1, register(self)))
+            backend ← retry(1.second, 3, Process("getBackend", Duration.Inf, 1, getBackend))
           } yield loop(backend.addresses.head)
         }
 
