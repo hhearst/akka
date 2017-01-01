@@ -6,6 +6,7 @@ package akka.typed
 import ScalaProcess._
 import patterns.Receptionist._
 import scala.concurrent.duration._
+import AskPattern._
 
 object ProcessSpec {
 
@@ -34,13 +35,42 @@ class ProcessSpec extends TypedSpec {
   object `A Process DSL` {
 
     def `must create working processes`(): Unit = {
-      def register(server: ActorRef[Request]) =
-        OpDSL[Registered[Request]] { implicit op ⇒
+
+      def register[T](server: ActorRef[T], key: ServiceKey[T]) =
+        OpDSL[Registered[T]] { implicit opDSL ⇒
           for {
             self ← processSelf
             system ← system
-            _ = system.receptionist ! Register(RequestService, server)(self)
-          } yield read
+          } yield {
+            val r = system.receptionist
+            r ! Register(key, server)(self)
+            read
+          }
+        }
+
+      def backend =
+        OpDSL[Login] { implicit opDSL ⇒
+          for {
+            self ← processSelf
+            _ ← call(register(self, LoginService).named("registerBackend"))
+            store ← fork(backendStore.named("store"))
+          } yield backendLoop(store.ref)
+        }
+
+      def backendLoop(store: ActorRef[Store]): Operation[Login, Nothing] =
+        OpDSL[Login] { implicit opDSL ⇒
+          for (Login(replyTo) ← read) yield {
+            replyTo ! AuthSuccess(store)
+            backendLoop(store)
+          }
+        }
+
+      lazy val backendStore: Operation[Store, Nothing] =
+        OpDSL[Store] { implicit opDSL ⇒
+          for (GetData(replyTo) ← read) yield {
+            replyTo ! DataResult("yeehah")
+            backendStore
+          }
         }
 
       def getBackend =
@@ -56,7 +86,7 @@ class ProcessSpec extends TypedSpec {
         OpDSL[AuthResult] { implicit opDSL ⇒
           for {
             self ← processSelf
-            _ ← unit(backend ! Login(self))
+            _ ← unit({ backend ! Login(self) })
             AuthSuccess(store) ← read
             data ← nextStep[DataResult](1, { implicit opDSL ⇒
               for {
@@ -71,21 +101,27 @@ class ProcessSpec extends TypedSpec {
         OpDSL[Request] { implicit opDSL ⇒
           for {
             req ← read
-            _ ← forkAndCancel(5.seconds, Process("worker", 10.seconds, 1, talkWithBackend(backend, req)))
+            _ ← forkAndCancel(5.seconds, talkWithBackend(backend, req).named("worker"))
           } yield loop(backend)
         }
 
       def server =
         OpDSL[Request] { implicit op ⇒
           for {
+            _ ← spawn(backend.named("backend"))
             self ← processSelf
-            _ ← retry(1.second, 3, Process("register", Duration.Inf, 1, register(self)))
-            backend ← retry(1.second, 3, Process("getBackend", Duration.Inf, 1, getBackend))
+            _ ← retry(1.second, 3, register(self, RequestService).named("register"))
+            backend ← retry(1.second, 3, getBackend.named("getBackend"))
           } yield loop(backend.addresses.head)
         }
 
-      val sys = ActorSystem("op", toBehavior(server))
-      sys ! MainCmd(Request("hello", null))
+      val sys = ActorSystem("op", toBehavior(server.named("server")))
+      try {
+        val f = sys ? ((r: ActorRef[Response]) ⇒ MainCmd(Request("hello", r)))
+        f.futureValue should ===(Response("yeehah"))
+      } finally {
+        sys.terminate()
+      }
     }
 
   }

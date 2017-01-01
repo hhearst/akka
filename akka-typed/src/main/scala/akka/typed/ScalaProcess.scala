@@ -124,6 +124,16 @@ object ScalaProcess {
      * it otherwise.
      */
     def withFilter(p: Out ⇒ Boolean): Process[S, Out] = flatMap(o ⇒ if (p(o)) Return(o) else ShortCircuit)
+
+    /**
+     * Create a copy with modified timeout parameter.
+     */
+    def withTimeout(timeout: Duration): Process[S, Out] = copy(timeout = timeout)
+
+    /**
+     * Create a copy with modified mailbox capacity.
+     */
+    def withMailboxCapacity(mailboxCapacity: Int): Process[S, Out] = copy(mailboxCapacity = mailboxCapacity)
   }
 
   /**
@@ -153,10 +163,13 @@ object ScalaProcess {
     def map[T, Mapped](f: Out ⇒ T)(implicit ev: MapAdapter[S, T, Mapped]): Operation[S, Mapped] = flatMap(ev.lift(f))
 
     /**
-     * Perform the given side-effect after this process step, continuing with
-     * the `Unit` value.
+     * Unfortunately for-comprehensions desugar to `.foreach` if the `yield`
+     * keyword is absent, but they do so throughout the whole expression.
+     * Coding a normal signature for `foreach` would break everything after
+     * the first step as it would not be executed—the `Unit` result is there
+     * already.
      */
-    def foreach(f: Out ⇒ Unit): Operation[S, Unit] = flatMap(o ⇒ Return(f(o)))
+    def foreach[T, Mapped](f: Out ⇒ T)(implicit ev: MapAdapter[S, T, Mapped]): Operation[S, Mapped] = flatMap(ev.lift(f))
 
     /**
      * Only continue this process if the given predicate is fulfilled, terminate
@@ -169,13 +182,22 @@ object ScalaProcess {
      * it otherwise.
      */
     def withFilter(p: Out ⇒ Boolean): Operation[S, Out] = flatMap(o ⇒ if (p(o)) Return(o) else ShortCircuit)
+
+    /**
+     * Wrap as a [[Process]] with infinite timeout and a mailbox capacity of 1.
+     * Small processes that are called or chained often interact in a fully
+     * sequential fashion, where these defaults make sense.
+     */
+    def named(name: String): Process[S, Out] = Process(name, Duration.Inf, 1, this)
   }
 
   /*
    * These are the private values that make up the core algebra.
    */
 
-  private[typed] case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2]
+  private[typed] case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2] {
+    override def toString: String = s"FlatMap($first)"
+  }
   private[typed] case object ShortCircuit extends Operation[Nothing, Nothing] {
     override def flatMap[T](f: Nothing ⇒ Operation[Nothing, T]): Operation[Nothing, T] = this
   }
@@ -387,12 +409,12 @@ object ScalaProcess {
    */
   def firstOf[T](timeout: Duration, processes: Process[_, T]*)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
     def forkAll(self: ActorRef[T], index: Int = 0,
-                p: List[Process[_, T]] = processes.toList,
+                p:   List[Process[_, T]]     = processes.toList,
                 acc: List[SubActor[Nothing]] = Nil)(implicit opDSL: OpDSL { type Self = T }): Operation[T, List[SubActor[Nothing]]] =
       p match {
         case Nil ⇒ unit(acc)
         case x :: xs ⇒
-          fork(x.copy(name = index.toString, operation = x.operation.map(x => { self ! x; x })))
+          fork(x.copy(name = index.toString, operation = x.operation.map(x ⇒ { self ! x; x })))
             .map(sub ⇒ forkAll(self, index + 1, xs, sub :: acc))
       }
     call(Process("firstOf", timeout, processes.size, OpDSL[T] { implicit opDSL ⇒
@@ -433,13 +455,13 @@ object ScalaProcess {
       }
   }
 
-  /*
-   * Convert it to runnable Behavior.
+  /**
+   * Convert a [[Process]] to a runnable Behavior.
    */
-  def toBehavior[S, T](op: Operation[S, T]): Behavior[ActorCmd[T]] = ???
+  def toBehavior[S, T](op: Process[S, T]): Behavior[ActorCmd[S]] = new internal.ProcessInterpreter(op)
 
   sealed trait ActorCmd[+T]
-  case class MainCmd[T](cmd: T) extends ActorCmd[T]
+  case class MainCmd[+T](cmd: T) extends ActorCmd[T]
   private[typed] trait InternalActorCmd[+T] extends ActorCmd[T]
 
   trait SubActor[-T] {
