@@ -47,7 +47,7 @@ private[typed] object ProcessInterpreter {
   case object NeedsExternalInput extends TraversalState
   case object NeedsInternalInput extends TraversalState
 
-  val Debug = false
+  val Debug = true
 }
 
 private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends Behavior[ActorCmd[T]] {
@@ -149,8 +149,13 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
     def isAlive: Boolean = toRead >= 0
 
     def apply(msg: Tself): ActorCmd[T] =
-      if (mailQueue.offer(msg)) this
-      else null // adapter drops nulls
+      if (mailQueue.offer(msg)) {
+        if (Debug) println(s"$ref accepting message $msg")
+        this
+      } else {
+        if (Debug) println(s"$ref dropping message $msg")
+        null // adapter drops nulls
+      }
 
     override val ref: ActorRef[Tself] = ctx.watch(ctx.spawnAdapter(this))
 
@@ -251,7 +256,7 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
             push(this)
             NeedsExternalInput
           }
-        case Self ⇒
+        case ProcessSelf ⇒
           push(ref)
           valueOrTrampoline()
         case ActorSelf ⇒
@@ -271,7 +276,7 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
           valueOrTrampoline()
         case Spawn(proc @ Process(name, timeout, mailboxCapacity, ops)) ⇒
           // FIXME make dispatcher configurable
-          push(ctx.spawn(toBehavior(proc), name, MailboxCapacity(mailboxCapacity)))
+          push(ctx.spawn(proc.toBehavior, name, MailboxCapacity(mailboxCapacity)))
           valueOrTrampoline()
         case Schedule(delay, msg, target) ⇒
           push(ctx.schedule(delay, target, msg))

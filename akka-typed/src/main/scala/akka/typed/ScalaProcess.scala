@@ -4,7 +4,7 @@
 package akka.typed
 
 import scala.concurrent.duration._
-import akka.actor.Cancellable
+import akka.{ actor ⇒ a }
 
 object ScalaProcess {
   import ScalaProcess._
@@ -25,10 +25,39 @@ object ScalaProcess {
   }
 
   object OpDSL {
+    private val _unit: Operation[Nothing, Null] = opUnit(null)(null: OpDSL { type Self = Nothing })
+    private def unit[S, Out]: Operation[S, Out] = _unit.asInstanceOf[Operation[S, Out]]
+
+    def loopInf[S]: NextLoopInf[S] = nextLoopInf.asInstanceOf[NextLoopInf[S]]
+    trait NextLoopInf[S] {
+      def apply[U](body: OpDSL { type Self = S } ⇒ Operation[S, U]): Operation[S, Nothing] = {
+        lazy val l: Operation[S, Nothing] = unit[S, OpDSL { type Self = S }].flatMap(body).flatMap(_ ⇒ l)
+        l
+      }
+    }
+    private object nextLoopInf extends NextLoopInf[Nothing]
+
+    def loop[S]: NextLoop[S] = nextLoop.asInstanceOf[NextLoop[S]]
+    trait NextLoop[S] {
+      def apply[Out](n: Int)(body: OpDSL { type Self = S } ⇒ Operation[S, Out]): Operation[S, List[Out]] = {
+        require(n > 0, "number of iterations must be positive")
+        def step(n: Int, acc: List[Out]): Operation[S, List[Out]] =
+          unit[S, OpDSL { type Self = S }]
+            .flatMap(body)
+            .flatMap {
+              case result if n == 1 ⇒ Return((result :: acc).reverse)
+              case result           ⇒ step(n - 1, result :: acc)
+            }
+        step(n, Nil)
+      }
+    }
+    private object nextLoop extends NextLoop[Nothing]
+
     def apply[T]: Next[T] = next.asInstanceOf[Next[T]]
 
     trait Next[T] {
-      def apply[U](body: OpDSL { type Self = T } ⇒ Operation[T, U]): Operation[T, U] = body(null)
+      def apply[U](body: OpDSL { type Self = T } ⇒ Operation[T, U]): Operation[T, U] =
+        unit[T, OpDSL { type Self = T }].flatMap(body)
     }
     private object next extends Next[Nothing]
 
@@ -87,6 +116,8 @@ object ScalaProcess {
    * to `Duration.Inf` for a server process.
    */
   case class Process[S, +Out](name: String, timeout: Duration, mailboxCapacity: Int, operation: Operation[S, Out]) {
+    a.ActorPath.validatePathElement(name)
+
     /**
      * Execute the given computation and process step after having completed
      * the current step. The current step’s computed value will be used as
@@ -134,6 +165,11 @@ object ScalaProcess {
      * Create a copy with modified mailbox capacity.
      */
     def withMailboxCapacity(mailboxCapacity: Int): Process[S, Out] = copy(mailboxCapacity = mailboxCapacity)
+
+    /**
+     * Convert to a runnable [[Behavior]].
+     */
+    def toBehavior: Behavior[ActorCmd[S]] = new internal.ProcessInterpreter(this)
   }
 
   /**
@@ -189,6 +225,7 @@ object ScalaProcess {
      * sequential fashion, where these defaults make sense.
      */
     def named(name: String): Process[S, Out] = Process(name, Duration.Inf, 1, this)
+
   }
 
   /*
@@ -204,13 +241,13 @@ object ScalaProcess {
 
   private[typed] case object System extends Operation[Nothing, ActorSystem[Nothing]]
   private[typed] case object Read extends Operation[Nothing, Nothing]
-  private[typed] case object Self extends Operation[Nothing, ActorRef[Any]]
+  private[typed] case object ProcessSelf extends Operation[Nothing, ActorRef[Any]]
   private[typed] case object ActorSelf extends Operation[Nothing, ActorRef[ActorCmd[Nothing]]]
   private[typed] case class Return[T](value: T) extends Operation[Nothing, T]
   private[typed] case class Call[S, T](process: Process[S, T]) extends Operation[Nothing, T]
   private[typed] case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
   private[typed] case class Spawn[S](process: Process[S, Any]) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
-  private[typed] case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, Cancellable]
+  private[typed] case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, a.Cancellable]
   private[typed] case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
   private[typed] case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
   private[typed] case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
@@ -226,37 +263,37 @@ object ScalaProcess {
   /**
    * Obtain a reference to the ActorSystem in which this process is running.
    */
-  def system(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorSystem[Nothing]] =
+  def opSystem(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorSystem[Nothing]] =
     System
 
   /**
    * Read a message from this process’ input channel.
    */
-  def read(implicit opDSL: OpDSL): Operation[opDSL.Self, opDSL.Self] =
+  def opRead(implicit opDSL: OpDSL): Operation[opDSL.Self, opDSL.Self] =
     Read
 
   /**
    * Obtain this process’ [[ActorRef]], not to be confused with the ActorRef of the Actor this process is running in.
    */
-  def processSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[opDSL.Self]] =
-    Self
+  def opProcessSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[opDSL.Self]] =
+    ProcessSelf
 
   /**
    * Obtain the [[ActorRef]] of the Actor this process is running in.
    */
-  def actorSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Nothing]]] =
+  def opActorSelf(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Nothing]]] =
     ActorSelf
 
   /**
    * Lift a plain value into a process that returns that value.
    */
-  def unit[U](value: U)(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
+  def opUnit[U](value: U)(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
     Return(value)
 
   /**
    * Execute the given process within the current Actor, await and return that process’ result.
    */
-  def call[Self, Out](process: Process[Self, Out])(implicit opDSL: OpDSL): Operation[opDSL.Self, Out] =
+  def opCall[Self, Out](process: Process[Self, Out])(implicit opDSL: OpDSL): Operation[opDSL.Self, Out] =
     Call(process)
 
   /**
@@ -264,7 +301,7 @@ object ScalaProcess {
    * await and return that process’ result. This is equivalent to creating
    * a process with [[OpDSL]] and using `call` to execute it.
    */
-  def nextStep[T] =
+  def opNextStep[T] =
     OpDSL.nextStep.asInstanceOf[OpDSL.NextStep[T]]
 
   /**
@@ -274,7 +311,7 @@ object ScalaProcess {
    * current process to communicate results. The returned [[SubActor]] reference
    * can be used to send messages to the forked process or to cancel it.
    */
-  def fork[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, SubActor[Self]] =
+  def opFork[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, SubActor[Self]] =
     Fork(process)
 
   /**
@@ -282,13 +319,13 @@ object ScalaProcess {
    * Actor. The new Actor is fully encapsulated behind the [[ActorRef]] that
    * is returned.
    */
-  def spawn[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Self]]] =
+  def opSpawn[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Self]]] =
     Spawn(process)
 
   /**
    * Schedule a message to be sent after the given delay has elapsed.
    */
-  def schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, Cancellable] =
+  def opSchedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, a.Cancellable] =
     Schedule(delay, msg, target)
 
   private val _any2Nil = (state: Any) ⇒ Nil → state
@@ -299,7 +336,7 @@ object ScalaProcess {
    * until after all outstanding updates for the key have been completed if
    * `afterUpdates` is `true`.
    */
-  def readState[T](key: StateKey[T], afterUpdates: Boolean = true)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+  def opReadState[T](key: StateKey[T], afterUpdates: Boolean = true)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
     State[T, StateKey[T], T](key, afterUpdates, any2Nil)
 
   /**
@@ -308,7 +345,7 @@ object ScalaProcess {
    * until after all outstanding updates for the key have been completed if
    * `afterUpdates` is `true`.
    */
-  def updateState[T, E](key: StateKey[T], afterUpdates: Boolean = true)(
+  def opUpdateState[T, E](key: StateKey[T], afterUpdates: Boolean = true)(
     transform: T ⇒ (Seq[key.Event], E))(implicit opDSL: OpDSL): Operation[opDSL.Self, E] =
     State(key, afterUpdates, transform)
 
@@ -317,7 +354,7 @@ object ScalaProcess {
    * process is suspended until after all outstanding updates for the key have been
    * completed if `afterUpdates` is `true`.
    */
-  def updateAndReadState[T](key: StateKey[T], afterUpdates: Boolean = true)(
+  def opUpdateAndReadState[T](key: StateKey[T], afterUpdates: Boolean = true)(
     transform: T ⇒ Seq[key.Event])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
     StateR(key, afterUpdates, transform)
 
@@ -326,7 +363,7 @@ object ScalaProcess {
    * all currently outstanding updates for this key have been completed,
    * suspending this process until done.
    */
-  def takeSnapshot[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+  def opTakeSnapshot[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
     Snapshot(key)
 
   /**
@@ -335,14 +372,14 @@ object ScalaProcess {
    * otherwise events are replayed from the beginning of the event log, starting
    * with the given initial data as the state before the first event is applied.
    */
-  def replayPersistentState[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+  def opReplayPersistentState[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
     Replay(key)
 
   /**
    * Remove the given [[StateKey]] from this Actor’s storage. The slot can be
    * filled again using `updateState` or `replayPersistentState`.
    */
-  def forgetState[T](key: StateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, akka.Done] =
+  def opForgetState[T](key: StateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, akka.Done] =
     Forget(key)
 
   /*
@@ -412,16 +449,16 @@ object ScalaProcess {
                 p:   List[Process[_, T]]     = processes.toList,
                 acc: List[SubActor[Nothing]] = Nil)(implicit opDSL: OpDSL { type Self = T }): Operation[T, List[SubActor[Nothing]]] =
       p match {
-        case Nil ⇒ unit(acc)
+        case Nil ⇒ opUnit(acc)
         case x :: xs ⇒
-          fork(x.copy(name = index.toString, operation = x.operation.map(x ⇒ { self ! x; x })))
+          opFork(x.copy(name = s"$index-${x.name}").map(self ! _))
             .map(sub ⇒ forkAll(self, index + 1, xs, sub :: acc))
       }
-    call(Process("firstOf", timeout, processes.size, OpDSL[T] { implicit opDSL ⇒
+    opCall(Process("firstOf", timeout, processes.size, OpDSL[T] { implicit opDSL ⇒
       for {
-        self ← processSelf
+        self ← opProcessSelf
         subs ← forkAll(self)
-        value ← read
+        value ← opRead
       } yield {
         subs.foreach(_.cancel())
         value
@@ -432,33 +469,25 @@ object ScalaProcess {
   def delay[T](time: FiniteDuration, value: T): Operation[T, T] =
     OpDSL[T] { implicit opDSL ⇒
       for {
-        self ← processSelf
-        _ ← schedule(time, value, self)
-      } yield read
+        self ← opProcessSelf
+        _ ← opSchedule(time, value, self)
+      } yield opRead
     }
-
-  def delayProcess[T](time: FiniteDuration, value: T): Process[T, T] =
-    Process("delay", time + 1.second, 1, delay(time, value))
 
   def forkAndCancel[T](timeout: FiniteDuration, process: Process[T, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, SubActor[T]] =
     for {
-      sub ← fork(process)
-      _ ← fork(Process("cancelAfter", Duration.Inf, 1, delay(timeout, ()).foreach(_ ⇒ sub.cancel())))
-    } yield unit(sub)
+      sub ← opFork(process)
+      _ ← opFork(Process("cancelAfter", Duration.Inf, 1, delay(timeout, ()).foreach(_ ⇒ sub.cancel())))
+    } yield opUnit(sub)
 
   def retry[S, T](timeout: FiniteDuration, retries: Int, ops: Process[S, T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
-    firstOf(Duration.Inf, ops.map(Some(_)), delayProcess(timeout, None))
+    firstOf(Duration.Inf, ops.map(Some(_)), delay(timeout, None).named("retryTimeout"))
       .map {
-        case Some(res)           ⇒ unit(res)
+        case Some(res)           ⇒ opUnit(res)
         case None if retries > 0 ⇒ retry(timeout, retries - 1, ops)
         case None                ⇒ throw new RetriesExceeded
       }
   }
-
-  /**
-   * Convert a [[Process]] to a runnable Behavior.
-   */
-  def toBehavior[S, T](op: Process[S, T]): Behavior[ActorCmd[S]] = new internal.ProcessInterpreter(op)
 
   sealed trait ActorCmd[+T]
   case class MainCmd[+T](cmd: T) extends ActorCmd[T]

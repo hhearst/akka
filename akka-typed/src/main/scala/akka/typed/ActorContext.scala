@@ -186,7 +186,14 @@ class StubbedActorContext[T](
 
   def executionContext: ExecutionContextExecutor = system.executionContext
 
-  def spawnAdapter[U](f: U ⇒ T): ActorRef[U] = spawnAnonymous[Any](Behavior.emptyBehavior)
+  def spawnAdapter[U](f: U ⇒ T): ActorRef[U] = {
+    val i = Inbox[U](childName.next())
+    _children += i.ref.path.name → i
+    new internal.FunctionRef[U](
+      self.path / i.ref.path.name,
+      (msg, _) ⇒ { val m = f(msg); if (m != null) { inbox.ref ! m; i.ref ! msg } },
+      (self) ⇒ inbox.ref.sorry.sendSystem(internal.DeathWatchNotification(self, null)))
+  }
 
   /**
    * Retrieve the named inbox. The passed ActorRef must be one that was returned
@@ -197,6 +204,11 @@ class StubbedActorContext[T](
     if (inbox.ref != child) throw new IllegalArgumentException(s"$child is not a child of $this")
     inbox
   }
+
+  /**
+   * Retrieve the named inbox.
+   */
+  def getInbox[U](name: String): Inbox[U] = _children(name).asInstanceOf[Inbox[U]]
 
   /**
    * Remove the given inbox from the list of children, for example after
