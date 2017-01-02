@@ -11,6 +11,7 @@ import org.scalatest.Succeeded
 import akka.actor.InvalidActorNameException
 import akka.Done
 import Effect._
+import java.util.concurrent.TimeoutException
 
 object ProcessSpec {
 
@@ -122,9 +123,85 @@ class ProcessSpec extends TypedSpec {
           }.map { results ⇒
             results should ===(List(Succeeded, Succeeded))
           }
-        }.named("main").toBehavior
+        }.withTimeout(3.seconds).toBehavior
       })
     }
+
+    def `must spawn`(): Unit = sync(runTest("spawn") {
+      OpDSL[Done] { implicit opDSL ⇒
+        for {
+          child ← opSpawn(OpDSL[ActorRef[Done]] { implicit opDSL ⇒
+            opRead.map(_ ! Done)
+          }.named("child").withMailboxCapacity(2))
+          self ← opProcessSelf
+          _ = child ! MainCmd(self)
+          msg ← opRead
+        } msg should ===(Done)
+      }.withTimeout(3.seconds).toBehavior
+    })
+
+    def `must watch`(): Unit = sync(runTest("watch") {
+      OpDSL[Done] { implicit opDSL ⇒
+        for {
+          self ← opProcessSelf
+          child ← opSpawn(opUnit(()).named("unit"))
+          _ ← opWatch(child, Done, self)
+        } opRead
+      }.withTimeout(3.seconds).toBehavior
+    })
+
+    def `must unwatch`(): Unit = sync(runTest("unwatch") {
+      OpDSL[String] { implicit opDSL ⇒
+        for {
+          self ← opProcessSelf
+          child ← opSpawn(opUnit(()).named("unit"))
+          cancellable ← opWatch(child, "dead", self)
+          _ ← opSchedule(50.millis, "alive", self)
+          msg ← { cancellable.cancel(); opRead }
+        } msg should ===("alive")
+      }.withTimeout(3.seconds).toBehavior
+    })
+
+    def `must respect timeouts`(): Unit = sync(runTest("timeout") {
+      OpDSL[Done] { implicit opDSL ⇒
+        for {
+          self ← opProcessSelf
+          filter = muteExpectedException[TimeoutException](occurrences = 1)
+          child ← opSpawn(opRead.named("read").withTimeout(10.millis))
+          _ ← opWatch(child, Done, self)
+          _ ← opRead
+        } filter.awaitDone(100.millis)
+      }.withTimeout(3.seconds).toBehavior
+    })
+
+    def `must cancel timeouts`(): Unit = sync(runTest("timeout") {
+      val childProc = OpDSL[String] { implicit opDSL ⇒
+        for {
+          self ← opProcessSelf
+          _ ← opFork(OpDSL[String] { _ ⇒ self ! ""; opRead }.named("read").withTimeout(1.second))
+        } opRead
+      }.named("child").withTimeout(100.millis)
+
+      OpDSL[Done] { implicit opDSL ⇒
+        for {
+          self ← opProcessSelf
+          start = Deadline.now
+          filter = muteExpectedException[TimeoutException](occurrences = 1)
+          child ← opSpawn(childProc)
+          _ ← opWatch(child, Done, self)
+          _ ← opRead
+        } yield {
+          (Deadline.now - start) should be > 1.second
+          filter.awaitDone(100.millis)
+        }
+      }.withTimeout(3.seconds).toBehavior
+    })
+
+    // TODO dropping messages on a subactor ref
+
+    // TODO dropping messages on the main ref including warning when dropping Traversals (or better: make it robust)
+
+    // TODO check that process refs are named after their processes
   }
 
   object `A ProcessDSL (native)` extends CommonTests with NativeSystem {
@@ -148,22 +225,20 @@ class ProcessSpec extends TypedSpec {
       }.named("read").toBehavior, 1, system)
 
       val Spawned(procName) = ctx.getEffect()
-      val Watched(procRef) = ctx.getEffect()
-      procRef.path.name should ===(procName)
       ctx.hasEffects should ===(false)
       val procInbox = ctx.getInbox[ActorRef[Done]](procName)
 
       ctx.run(MainCmd(ret.ref))
       procInbox.receiveAll() should ===(List(ret.ref))
 
-      val t: ActorCmd[ActorRef[Done]] = ctx.inbox.receiveMsg() match {
-        case sub: SubActor[_] ⇒
-          sub.ref should ===(procRef)
-          sub
-        case other ⇒ fail(s"expected SubActor, got $other")
+      val t = ctx.inbox.receiveMsg()
+      t match {
+        case sub: SubActor[_] ⇒ sub.ref.path.name should ===(procName)
+        case other            ⇒ fail(s"expected SubActor, got $other")
       }
       ctx.run(t)
       ctx.getAllEffects() should ===(Nil)
+      ctx.inbox.receiveAll() should ===(Nil)
       ret.receiveAll() should ===(List(Done))
       ctx.isAlive should ===(false)
     }
@@ -177,26 +252,65 @@ class ProcessSpec extends TypedSpec {
       }.named("call").toBehavior, 1, system)
 
       val Spawned(procName) = ctx.getEffect()
-      val Watched(procRef) = ctx.getEffect()
-      procRef.path.name should ===(procName)
       ctx.hasEffects should ===(false)
       val procInbox = ctx.getInbox[ActorRef[Done]](procName)
 
       ctx.run(MainCmd(ret.ref))
       procInbox.receiveAll() should ===(List(ret.ref))
 
-      val t: ActorCmd[ActorRef[Done]] = ctx.inbox.receiveMsg() match {
-        case sub: SubActor[_] ⇒
-          sub.ref should ===(procRef)
-          sub
-        case other ⇒ fail(s"expected SubActor, got $other")
+      val t = ctx.inbox.receiveMsg()
+      t match {
+        case sub: SubActor[_] ⇒ sub.ref.path.name should ===(procName)
+        case other            ⇒ fail(s"expected SubActor, got $other")
       }
       ctx.run(t)
       val Spawned(calledName) = ctx.getEffect()
-      val Watched(calledRef) = ctx.getEffect()
-      calledRef.path.name should ===(calledName)
 
       ctx.getAllEffects() should ===(Nil)
+      ctx.inbox.receiveAll() should ===(Nil)
+      ret.receiveAll() should ===(List(Done))
+      ctx.isAlive should ===(false)
+    }
+
+    def `must fork`(): Unit = {
+      val ret = Inbox[Done]("callRet")
+      val ctx = new EffectfulActorContext("call", OpDSL[ActorRef[Done]] { implicit opDSL ⇒
+        opFork(opRead.map(_ ! Done).named("forkee"))
+          .map { sub ⇒
+            opRead.map(sub.ref ! _)
+          }
+      }.named("call").toBehavior, 1, system)
+
+      val Spawned(procName) = ctx.getEffect()
+      val procInbox = ctx.getInbox[ActorRef[Done]](procName)
+
+      val Spawned(forkName) = ctx.getEffect()
+      val forkInbox = ctx.getInbox[ActorRef[Done]](forkName)
+      ctx.hasEffects should ===(false)
+
+      ctx.run(MainCmd(ret.ref))
+      procInbox.receiveAll() should ===(List(ret.ref))
+      ctx.getAllEffects() should ===(Nil)
+
+      val t1 = ctx.inbox.receiveMsg()
+      t1 match {
+        case sub: SubActor[_] ⇒ sub.ref.path.name should ===(procName)
+        case other            ⇒ fail(s"expected SubActor, got $other")
+      }
+
+      ctx.run(t1)
+      forkInbox.receiveAll() should ===(List(ret.ref))
+      ctx.getAllEffects() should ===(Nil)
+
+      val t2 = ctx.inbox.receiveMsg()
+      t2 match {
+        case sub: SubActor[_] ⇒ sub.ref.path.name should ===(forkName)
+        case other            ⇒ fail(s"expected SubActor, got $other")
+      }
+
+      ctx.run(t2)
+      ctx.getAllEffects() should ===(Nil)
+      ctx.inbox.receiveAll() should ===(Nil)
       ret.receiveAll() should ===(List(Done))
       ctx.isAlive should ===(false)
     }
@@ -214,15 +328,13 @@ class ProcessSpec extends TypedSpec {
       }.named("things").toBehavior, 1, system)
 
       val Spawned(procName) = ctx.getEffect()
-      val Watched(procRef) = ctx.getEffect()
-      procRef.path.name should ===(procName)
       ctx.hasEffects should ===(false)
       ctx.isAlive should ===(false)
 
       val Info(sys, proc, actor, value) = ret.receiveMsg()
       ret.hasMessages should ===(false)
       sys should ===(system)
-      proc should ===(procRef)
+      proc.path.name should ===(procName)
       actor.path should ===(proc.path.parent)
       value should ===(42)
     }

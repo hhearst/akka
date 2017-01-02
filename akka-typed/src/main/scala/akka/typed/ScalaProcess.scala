@@ -115,8 +115,8 @@ object ScalaProcess {
    * allotted a maximum lifetime after which it is canceled; you may set this
    * to `Duration.Inf` for a server process.
    */
-  case class Process[S, +Out](name: String, timeout: Duration, mailboxCapacity: Int, operation: Operation[S, Out]) {
-    a.ActorPath.validatePathElement(name)
+  final case class Process[S, +Out](name: String, timeout: Duration, mailboxCapacity: Int, operation: Operation[S, Out]) {
+    if (name != "") a.ActorPath.validatePathElement(name)
 
     /**
      * Execute the given computation and process step after having completed
@@ -226,6 +226,21 @@ object ScalaProcess {
      */
     def named(name: String): Process[S, Out] = Process(name, Duration.Inf, 1, this)
 
+    /**
+     * Wrap as a [[Process]] with the given mailbox capacity and infinite timeout.
+     */
+    def withMailboxCapacity(mailboxCapacity: Int): Process[S, Out] = named("").withMailboxCapacity(mailboxCapacity)
+
+    /**
+     * Wrap as a [[Process]] with the given timeout and a mailbox capacity of 1.
+     */
+    def withTimeout(timeout: Duration): Process[S, Out] = named("").withTimeout(timeout)
+
+    /**
+     * Wrap as a [[Process]] but without a name and convert to a [[Behavior]].
+     */
+    def toBehavior: Behavior[ActorCmd[S]] = named("").toBehavior
+
   }
 
   /*
@@ -246,8 +261,15 @@ object ScalaProcess {
   private[typed] case class Return[T](value: T) extends Operation[Nothing, T]
   private[typed] case class Call[S, T](process: Process[S, T]) extends Operation[Nothing, T]
   private[typed] case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
-  private[typed] case class Spawn[S](process: Process[S, Any]) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
+  private[typed] case class Spawn[S](process: Process[S, Any], deployment: DeploymentConfig) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
   private[typed] case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, a.Cancellable]
+  private[typed] sealed trait AbstractWatchRef { type Msg }
+  private[typed] case class WatchRef[T](watchee: ActorRef[Nothing], msg: T, target: ActorRef[T])
+    extends Operation[Nothing, a.Cancellable] with AbstractWatchRef {
+    type Msg = T
+    override def equals(other: Any) = super.equals(other)
+    override def hashCode() = super.hashCode()
+  }
   private[typed] case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
   private[typed] case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
   private[typed] case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
@@ -318,15 +340,31 @@ object ScalaProcess {
    * Execute the given process in a newly spawned child Actor of the current
    * Actor. The new Actor is fully encapsulated behind the [[ActorRef]] that
    * is returned.
+   *
+   * The mailboxCapacity for the Actor is configured using the optional
+   * [[DeploymentConfig]] while the initial process’ process mailbox is
+   * limited based on the [[Process]] configuration as usual. When sizing
+   * the Actor mailbox capacity you need to consider that communication
+   * between the processes hosted by that Actor and timeouts also go through
+   * this mailbox.
    */
-  def opSpawn[Self](process: Process[Self, Any])(implicit opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Self]]] =
-    Spawn(process)
+  def opSpawn[Self](process: Process[Self, Any], deployment: DeploymentConfig = EmptyDeploymentConfig)(
+    implicit
+    opDSL: OpDSL): Operation[opDSL.Self, ActorRef[ActorCmd[Self]]] =
+    Spawn(process, deployment)
 
   /**
    * Schedule a message to be sent after the given delay has elapsed.
    */
   def opSchedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, a.Cancellable] =
     Schedule(delay, msg, target)
+
+  /**
+   * Watch the given [[ActorRef]] and send the specified message to the given
+   * target when the watched actor has terminated.
+   */
+  def opWatch[T](watchee: ActorRef[Nothing], msg: T, target: ActorRef[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, a.Cancellable] =
+    WatchRef(watchee, msg, target)
 
   private val _any2Nil = (state: Any) ⇒ Nil → state
   private def any2Nil[T] = _any2Nil.asInstanceOf[T ⇒ (Nil.type, T)]
@@ -444,7 +482,7 @@ object ScalaProcess {
   /*
    * Derived operations
    */
-  def firstOf[T](timeout: Duration, processes: Process[_, T]*)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
+  def firstOf[T](timeout: Duration, processes: Process[_, T]*): Operation[T, T] = {
     def forkAll(self: ActorRef[T], index: Int = 0,
                 p:   List[Process[_, T]]     = processes.toList,
                 acc: List[SubActor[Nothing]] = Nil)(implicit opDSL: OpDSL { type Self = T }): Operation[T, List[SubActor[Nothing]]] =
@@ -454,7 +492,7 @@ object ScalaProcess {
           opFork(x.copy(name = s"$index-${x.name}").map(self ! _))
             .map(sub ⇒ forkAll(self, index + 1, xs, sub :: acc))
       }
-    opCall(Process("firstOf", timeout, processes.size, OpDSL[T] { implicit opDSL ⇒
+    OpDSL[T] { implicit opDSL ⇒
       for {
         self ← opProcessSelf
         subs ← forkAll(self)
@@ -463,7 +501,7 @@ object ScalaProcess {
         subs.foreach(_.cancel())
         value
       }
-    }))
+    }
   }
 
   def delay[T](time: FiniteDuration, value: T): Operation[T, T] =
@@ -481,7 +519,7 @@ object ScalaProcess {
     } yield opUnit(sub)
 
   def retry[S, T](timeout: FiniteDuration, retries: Int, ops: Process[S, T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] = {
-    firstOf(Duration.Inf, ops.map(Some(_)), delay(timeout, None).named("retryTimeout"))
+    opCall(firstOf(Duration.Inf, ops.map(Some(_)), delay(timeout, None).named("retryTimeout")).named("firstOf"))
       .map {
         case Some(res)           ⇒ opUnit(res)
         case None if retries > 0 ⇒ retry(timeout, retries - 1, ops)
