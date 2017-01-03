@@ -9,13 +9,6 @@ import language.implicitConversions
 import scala.concurrent.Future
 
 /**
- * Helper parent to allow [[ActorRef]] to be used as key in TypedMultiMap.
- */
-sealed trait AbstractActorRef {
-  type Msg
-}
-
-/**
  * An ActorRef is the identity or address of an Actor instance. It is valid
  * only during the Actor’s lifetime and allows messages to be sent to that
  * Actor instance. Sending a message to an Actor that has terminated before
@@ -24,9 +17,7 @@ sealed trait AbstractActorRef {
  * [[akka.event.EventStream]] on a best effort basis
  * (i.e. this delivery is not reliable).
  */
-abstract class ActorRef[-T](_path: a.ActorPath) extends java.lang.Comparable[ActorRef[Nothing]] with AbstractActorRef { this: internal.ActorRefImpl[T] ⇒
-
-  type Msg >: T
+abstract class ActorRef[-T](_path: a.ActorPath) extends java.lang.Comparable[ActorRef[Nothing]] { this: internal.ActorRefImpl[T] ⇒
 
   /**
    * Send a message to the Actor referenced by this ActorRef using *at-most-once*

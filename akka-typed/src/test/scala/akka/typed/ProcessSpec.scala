@@ -12,6 +12,9 @@ import akka.actor.InvalidActorNameException
 import akka.Done
 import Effect._
 import java.util.concurrent.TimeoutException
+import org.scalatest.prop.PropertyChecks
+import scala.collection.immutable.TreeSet
+import scala.util.Random
 
 object ProcessSpec {
 
@@ -191,17 +194,29 @@ class ProcessSpec extends TypedSpec {
           _ ← opWatch(child, Done, self)
           _ ← opRead
         } yield {
+          // weird: without this I get diverging implicits on the `>`
+          import FiniteDuration.FiniteDurationIsOrdered
           (Deadline.now - start) should be > 1.second
           filter.awaitDone(100.millis)
         }
       }.withTimeout(3.seconds).toBehavior
     })
 
+    def `must name process refs appropriately`(): Unit = sync(runTest("naming") {
+      OpDSL[Done] { implicit opDSL ⇒
+        opProcessSelf.foreach { self ⇒
+          val name = self.path.name
+          withClue(s" name=$name") {
+            name.substring(0, 1) should ===("$")
+            name.substring(name.length - 5) should ===("-read")
+          }
+        }
+      }.named("read").toBehavior
+    })
+
     // TODO dropping messages on a subactor ref
 
     // TODO dropping messages on the main ref including warning when dropping Traversals (or better: make it robust)
-
-    // TODO check that process refs are named after their processes
   }
 
   object `A ProcessDSL (native)` extends CommonTests with NativeSystem {
@@ -216,6 +231,18 @@ class ProcessSpec extends TypedSpec {
       a[InvalidActorNameException] mustBe thrownBy {
         Process("$hello", Duration.Inf, 1, null)
       }
+    }
+
+    def `must name process refs appropriately (EffectfulActorContext)`(): Unit = {
+      val ctx = new EffectfulActorContext("name", OpDSL[ActorRef[Done]] { implicit opDSL ⇒
+        opRead
+      }.named("read").toBehavior, 1, system)
+      val Spawned(name) = ctx.getEffect()
+      withClue(s" name=$name") {
+        name.substring(0, 1) should ===("$")
+        name.substring(name.length - 5) should ===("-read")
+      }
+      ctx.getAllEffects() should ===(Nil)
     }
 
     def `must read`(): Unit = {
@@ -339,8 +366,237 @@ class ProcessSpec extends TypedSpec {
       value should ===(42)
     }
 
+    def `must filter`(): Unit = {
+      val ctx = new EffectfulActorContext("filter", OpDSL[String] { implicit opDSL ⇒
+        for {
+          self ← opProcessSelf
+          if false
+        } opRead
+      }.toBehavior, 1, system)
+
+      val Spawned(procName) = ctx.getEffect()
+      ctx.hasEffects should ===(false)
+      ctx.isAlive should ===(false)
+    }
+
+    def `must filter across call`(): Unit = {
+      val ctx = new EffectfulActorContext("filter", OpDSL[String] { implicit opDSL ⇒
+        val callee =
+          for {
+            self ← opProcessSelf
+            if false
+          } opRead
+
+        for {
+          _ ← opCall(callee.named("callee"))
+        } opRead
+      }.toBehavior, 1, system)
+
+      val Spawned(procName) = ctx.getEffect()
+      val Spawned(calleeName) = ctx.getEffect()
+      calleeName should endWith("-callee")
+      ctx.hasEffects should ===(false)
+      ctx.isAlive should ===(false)
+    }
+
+    def `must filter across call with replacement value`(): Unit = {
+      var received: String = null
+      val ctx = new EffectfulActorContext("filter", OpDSL[String] { implicit opDSL ⇒
+        val callee =
+          for {
+            self ← opProcessSelf
+            if false
+          } opRead
+
+        for {
+          result ← opCall(callee.named("callee"), Some("hello"))
+        } yield {
+          received = result
+          opRead
+        }
+      }.toBehavior, 1, system)
+
+      val Spawned(_) = ctx.getEffect()
+      val Spawned(calleeName) = ctx.getEffect()
+      calleeName should endWith("-callee")
+      ctx.hasEffects should ===(false)
+      ctx.isAlive should ===(true)
+      received should ===("hello")
+    }
+
+    def `must cleanup at the right times`(): Unit = {
+      var calls = List.empty[Int]
+      def call(n: Int): Unit = calls ::= n
+
+      val ctx = new EffectfulActorContext("cleanup", OpDSL[String] { implicit opDSL ⇒
+        (for {
+          _ ← opProcessSelf
+          _ = call(0)
+          _ ← opCleanup(() ⇒ call(1))
+          _ ← opUnit(call(2))
+        } opCleanup(() ⇒ call(3))
+        ).foreach { msg ⇒
+          msg should ===(Done)
+          call(4)
+        }
+      }.toBehavior, 1, system)
+
+      val Spawned(_) = ctx.getEffect()
+      ctx.getAllEffects() should ===(Nil)
+      ctx.isAlive should ===(false)
+      calls.reverse should ===(List(0, 2, 3, 1, 4))
+    }
+
+    def `must cleanup when short-circuiting`(): Unit = {
+      var calls = List.empty[Int]
+      def call(n: Int): Unit = calls ::= n
+
+      val ctx = new EffectfulActorContext("cleanup", OpDSL[String] { implicit opDSL ⇒
+        val callee =
+          for {
+            _ ← opProcessSelf
+            _ ← opUnit(call(10))
+            _ ← opCleanup(() ⇒ call(11))
+            if false
+          } call(12)
+
+        (for {
+          _ ← opProcessSelf
+          _ = call(0)
+          _ ← opCleanup(() ⇒ call(1))
+          _ ← opCall(callee.named("callee"))
+        } opCleanup(() ⇒ call(3))
+        ).foreach { _ ⇒
+          call(4)
+        }
+      }.toBehavior, 1, system)
+
+      val Spawned(_) = ctx.getEffect()
+      val Spawned(calleeName) = ctx.getEffect()
+      calleeName should endWith("-callee")
+      ctx.getAllEffects() should ===(Nil)
+      ctx.isAlive should ===(false)
+      calls.reverse should ===(List(0, 10, 11, 1))
+    }
+
+    def `must cleanup when short-circuiting with replacement`(): Unit = {
+      var calls = List.empty[Int]
+      def call(n: Int): Unit = calls ::= n
+
+      val ctx = new EffectfulActorContext("cleanup", OpDSL[String] { implicit opDSL ⇒
+        val callee =
+          for {
+            _ ← opProcessSelf
+            _ ← opUnit(call(10))
+            _ ← opCleanup(() ⇒ call(11))
+            _ ← opCleanup(() ⇒ call(12))
+            if false
+          } call(13)
+
+        (for {
+          _ ← opProcessSelf
+          _ = call(0)
+          _ ← opCleanup(() ⇒ call(1))
+          _ ← opCall(callee.named("callee"), Some("hello"))
+        } opCleanup(() ⇒ call(3))
+        ).foreach { msg ⇒
+          msg should ===(Done)
+          call(4)
+        }
+      }.toBehavior, 1, system)
+
+      val Spawned(_) = ctx.getEffect()
+      val Spawned(calleeName) = ctx.getEffect()
+      calleeName should endWith("-callee")
+      ctx.getAllEffects() should ===(Nil)
+      ctx.isAlive should ===(false)
+      calls.reverse should ===(List(0, 10, 12, 11, 3, 1, 4))
+    }
+
+    def `must cleanup at the right times when failing in cleanup`(): Unit = {
+      var calls = List.empty[Int]
+      def call(n: Int): Unit = calls ::= n
+
+      val ctx = new EffectfulActorContext("cleanup", OpDSL[String] { implicit opDSL ⇒
+        (for {
+          _ ← opCleanup(() ⇒ call(0))
+          _ ← opCleanup(() ⇒ call(1))
+          _ ← opCleanup(() ⇒ throw new Exception("expected"))
+          _ ← opRead
+        } opCleanup(() ⇒ call(3))
+        ).foreach { _ ⇒
+          call(4)
+        }
+      }.toBehavior, 1, system)
+
+      val Spawned(mainName) = ctx.getEffect()
+      ctx.getAllEffects() should ===(Nil)
+
+      ctx.run(MainCmd(""))
+      ctx.getInbox[String](mainName).receiveAll() should ===(List(""))
+      val t = ctx.inbox.receiveMsg()
+      a[Exception] shouldBe thrownBy {
+        ctx.run(t)
+      }
+      calls.reverse should ===(List(3))
+
+      ctx.signal(PostStop)
+
+      ctx.getAllEffects() should ===(Nil)
+      calls.reverse should ===(List(3, 1, 0))
+    }
+
+    def `must cleanup at the right times when failing somewhere else`(): Unit = {
+      var calls = List.empty[Int]
+      def call(n: Int): Unit = calls ::= n
+
+      val ctx = new EffectfulActorContext("cleanup", OpDSL[String] { implicit opDSL ⇒
+        for {
+          _ ← opFork(
+            (for {
+              _ ← opCleanup(() ⇒ call(0))
+              _ ← opCleanup(() ⇒ call(1))
+            } opRead).named("fork"))
+          _ ← opRead
+        } throw new Exception("expected")
+      }.toBehavior, 1, system)
+
+      val Spawned(mainName) = ctx.getEffect()
+      val Spawned(forkName) = ctx.getEffect()
+      forkName should endWith("-fork")
+      ctx.getAllEffects() should ===(Nil)
+
+      ctx.run(MainCmd(""))
+      ctx.getInbox[String](mainName).receiveAll() should ===(List(""))
+      val t = ctx.inbox.receiveMsg()
+      a[Exception] shouldBe thrownBy {
+        ctx.run(t)
+      }
+      calls.reverse should ===(List())
+
+      ctx.signal(PostStop)
+
+      ctx.getAllEffects() should ===(Nil)
+      calls.reverse should ===(List(1, 0))
+    }
+
   }
 
   object `A ProcessDSL (adapted)` extends CommonTests with AdaptedSystem
+
+  object `A TimeoutOrdering` extends PropertyChecks {
+    def `must sort correctly`(): Unit = {
+      forAll { (l: List[Int]) ⇒
+        val offsets = (TreeSet.empty[Int] ++ l.filterNot(_ == 1)).toVector
+        val deadlines = offsets.map(o ⇒ Deadline((Long.MaxValue + o).nanos))
+        val mapping = deadlines.zip(offsets).toMap
+        val shuffled = Random.shuffle(deadlines)
+        val sorted = TreeSet.empty(internal.ProcessInterpreter.timeoutOrdering) ++ shuffled
+        withClue(s" mapping=$mapping shuffled=$shuffled sorted=$sorted") {
+          sorted.toVector.map(mapping) should ===(offsets)
+        }
+      }
+    }
+  }
 
 }

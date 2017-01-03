@@ -16,6 +16,8 @@ import scala.collection.immutable.TreeSet
 import akka.actor.Cancellable
 import java.util.concurrent.TimeoutException
 import akka.util.TypedMultiMap
+import akka.Done
+import akka.event.Logging
 
 /**
  * Implementation notes:
@@ -39,8 +41,7 @@ import akka.util.TypedMultiMap
  * TODO:
  *   process timeout means failure
  *   cleanup actions via State
- *   make adapter ref names configurable (should append process name)
- *   warn when spawning with mailboxCapacity 1
+ *   enable noticing when watchee failed
  */
 private[typed] object ProcessInterpreter {
 
@@ -50,13 +51,33 @@ private[typed] object ProcessInterpreter {
   case object NeedsExternalInput extends TraversalState
   case object NeedsInternalInput extends TraversalState
 
+  // used when ShortCircuit stops the process
+  case object NoValue
+
+  final case class RunCleanup(cleanup: () ⇒ Unit)
+
   val Debug = false
 
+  /*
+   * The normal ordering provides a transitive order that does not cope well
+   * with wrap-arounds. This ordering is only transitive if all values to be
+   * sorted are within a 290 year interval, but then it does the right thing
+   * regardless of where a wrap-around occurs.
+   */
+  implicit val timeoutOrdering: Ordering[Deadline] =
+    new Ordering[Deadline] {
+      override def compare(a: Deadline, b: Deadline): Int = {
+        val diff = a.time.toNanos - b.time.toNanos
+        if (diff > 0) 1 else if (diff < 0) -1 else 0
+      }
+    }
   val emptyTimeouts = TreeSet.empty[Deadline]
   val notScheduled: Cancellable = new Cancellable {
     def cancel(): Boolean = false
     def isCancelled: Boolean = true
   }
+
+  val wrapReturn = (o: Any) ⇒ Return(o).asInstanceOf[Operation[Any, Any]]
 
   case class Timeout(deadline: Deadline) extends InternalActorCmd[Nothing]
 }
@@ -81,7 +102,7 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
         else processRoots += mainProcess
         execute(ctx)
       case PostStop ⇒
-        // FIXME clean everything up
+        processRoots.foreach(_.cancel())
         Same
       case Terminated(ref) ⇒
         watchMap.get(ref) match {
@@ -99,7 +120,8 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
 
   def message(ctx: ActorContext[ActorCmd[T]], msg: ActorCmd[T]): Behavior[ActorCmd[T]] = {
     // for paranoia: if Timeout message is lost due to bounded mailbox (costs 50ns if nonEmpty)
-    if (timeouts.nonEmpty && Deadline.now >= timeouts.head) throw new TimeoutException("process timeout expired")
+    if (timeouts.nonEmpty && Deadline.now.time.toNanos - timeouts.head.time.toNanos >= 0)
+      throw new TimeoutException("process timeout expired")
 
     msg match {
       case t: Traversal[_] ⇒
@@ -246,7 +268,7 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
         null // adapter drops nulls
       }
 
-    override val ref: ActorRef[Tself] = ctx.spawnAdapter(this)
+    override val ref: ActorRef[Tself] = ctx.spawnAdapter(this, process.name)
 
     /*
      * Implementation of traversal logic
@@ -265,11 +287,11 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
         s"Traversal(${ref.path.name}, ${process.name}, $state, $stackList, $ptr)"
       } else super.toString
 
-    @tailrec private def depth(op: Operation[_, Any] = process.operation, d: Int = 0): Int =
+    @tailrec private def depth(op: Operation[_, Any], d: Int = 0): Int =
       op match {
-        case FlatMap(next, _) ⇒ depth(next, d + 1)
-        case Read | Call(_)   ⇒ d + 2
-        case _                ⇒ d + 1
+        case FlatMap(next, _)               ⇒ depth(next, d + 1)
+        case Read | Call(_, _) | Cleanup(_) ⇒ d + 2
+        case _                              ⇒ d + 1
       }
 
     /*
@@ -279,7 +301,7 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
      *  - NeedsExternalInput: pop valueOrInput, then pop operation
      *  - NeedsInternalInput: pop valueOrTraversal, then pop operation
      */
-    private var stack = new Array[AnyRef](Math.max(depth(), 5))
+    private var stack = new Array[AnyRef](5)
     private var ptr = 0
     private var _state: TraversalState = initialize(process.operation)
 
@@ -306,6 +328,11 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
       if (ptr == 1) {
         shutdown()
         HasValue
+      } else if (peek() == NoValue) {
+        runCleanups()
+        push(NoValue)
+        shutdown()
+        HasValue
       } else {
         queue.add(this)
         NeedsTrampoline
@@ -326,60 +353,80 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
      */
     def state: TraversalState = _state
 
-    @tailrec private def initialize(node: Operation[_, Any]): TraversalState =
-      node match {
-        case FlatMap(first, _) ⇒
-          push(node)
-          initialize(first)
-        case System ⇒
-          push(ctx.system)
-          valueOrTrampoline()
-        case Read ⇒
-          if (canReceive) {
-            push(receiveOne())
-            valueOrTrampoline()
-          } else {
+    private def initialize(node: Operation[_, Any]): TraversalState = {
+      @tailrec def rec(node: Operation[_, Any]): TraversalState =
+        node match {
+          case FlatMap(first, _) ⇒
             push(node)
-            push(this)
-            NeedsExternalInput
-          }
-        case ProcessSelf ⇒
-          push(ref)
-          valueOrTrampoline()
-        case ActorSelf ⇒
-          push(ctx.self)
-          valueOrTrampoline()
-        case Return(value) ⇒
-          push(value)
-          valueOrTrampoline()
-        case Call(process) ⇒
-          push(node)
-          push(triggerOn(new Traversal(process, ctx)))
-          NeedsInternalInput
-        case Fork(other) ⇒
-          val t = new Traversal(other, ctx)
-          processRoots += t
-          push(t)
-          valueOrTrampoline()
-        case Spawn(proc @ Process(name, timeout, mailboxCapacity, ops), deployment) ⇒
-          push(ctx.spawn(proc.toBehavior, name, deployment))
-          valueOrTrampoline()
-        case Schedule(delay, msg, target) ⇒
-          push(ctx.schedule(delay, target, msg))
-          valueOrTrampoline()
-        case w: WatchRef[_] ⇒
-          push(watch(ctx, w))
-          valueOrTrampoline()
+            rec(first)
+          case ShortCircuit ⇒
+            push(NoValue)
+            valueOrTrampoline()
+          case System ⇒
+            push(ctx.system)
+            valueOrTrampoline()
+          case Read ⇒
+            if (canReceive) {
+              push(receiveOne())
+              valueOrTrampoline()
+            } else {
+              push(node)
+              push(this)
+              NeedsExternalInput
+            }
+          case ProcessSelf ⇒
+            push(ref)
+            valueOrTrampoline()
+          case ActorSelf ⇒
+            push(ctx.self)
+            valueOrTrampoline()
+          case Return(value) ⇒
+            push(value)
+            valueOrTrampoline()
+          case Call(process, _) ⇒
+            push(node)
+            push(triggerOn(new Traversal(process, ctx)))
+            NeedsInternalInput
+          case Fork(other) ⇒
+            val t = new Traversal(other, ctx)
+            processRoots += t
+            push(t)
+            valueOrTrampoline()
+          case Spawn(proc @ Process(name, timeout, mailboxCapacity, ops), deployment) ⇒
+            push(ctx.spawn(proc.toBehavior, name, deployment))
+            valueOrTrampoline()
+          case Schedule(delay, msg, target) ⇒
+            push(ctx.schedule(delay, target, msg))
+            valueOrTrampoline()
+          case w: WatchRef[_] ⇒
+            push(watch(ctx, w))
+            valueOrTrampoline()
+          case Cleanup(cleanup) ⇒
+            val f @ FlatMap(_, _) = pop() // this is ensured at the end of initialize()
+            push(RunCleanup(cleanup))
+            push(f)
+            push(Done)
+            valueOrTrampoline()
+        }
+
+      node match {
+        case _: Cleanup ⇒
+          ensureSpace(depth(node) + 1)
+          rec(FlatMap(node.asInstanceOf[Operation[Any, Any]], wrapReturn))
+        case _ ⇒
+          ensureSpace(depth(node))
+          rec(node)
       }
+    }
 
     def dispatchInput(value: Any, source: Traversal[_]): Unit = {
       if (Debug) println(s"${ctx.self} dispatching input $value from ${source.process.name} to $this")
       _state match {
         case NeedsInternalInput ⇒
           assert(source eq pop())
-          val Call(proc) = pop()
+          val Call(proc, replacement) = pop()
           assert(source.process eq proc)
-          push(value)
+          if (value != NoValue) push(value) else push(replacement.getOrElse(NoValue))
           _state = valueOrTrampoline()
         case NeedsExternalInput ⇒
           assert(this eq pop())
@@ -394,29 +441,65 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
       if (Debug) println(s"${ctx.self} dispatching trampoline for $this")
       assert(_state == NeedsTrampoline)
       val value = pop()
-      val FlatMap(_, cont) = pop()
-      val contOps = cont(value)
-      if (Debug) println(s"${ctx.self} flatMap yielded $contOps")
-      ensureSpace(depth(contOps))
-      _state = initialize(contOps)
+      pop() match {
+        case FlatMap(_, cont) ⇒
+          val contOps = cont(value)
+          if (Debug) println(s"${ctx.self} flatMap yielded $contOps")
+          _state = initialize(contOps)
+        case RunCleanup(cleanup) ⇒
+          cleanup()
+          push(value)
+          _state = valueOrTrampoline()
+      }
     }
 
     def cancel(): Unit = {
       if (Debug) println(s"${ctx.self} canceling $this")
-      @tailrec def rec(t: Traversal[_]): Unit =
+      @tailrec def rec(t: Traversal[_], acc: List[RunCleanup]): List[RunCleanup] =
         if (t.isAlive) {
           t.shutdown()
           t._state match {
-            case HasValue           ⇒ // nothing to do
-            case NeedsTrampoline    ⇒
-            case NeedsExternalInput ⇒
+            case HasValue           ⇒ acc
+            case NeedsTrampoline    ⇒ addCleanups(t, acc)
+            case NeedsExternalInput ⇒ addCleanups(t, acc)
             case NeedsInternalInput ⇒
               val next = pop().asInstanceOf[Traversal[_]]
               internalTriggers -= next
-              rec(next)
+              rec(next, addCleanups(t, acc))
           }
+        } else Nil
+      @tailrec def addCleanups(t: Traversal[_], acc: List[RunCleanup], idx: Int = 0): List[RunCleanup] =
+        if (idx < t.ptr) {
+          t.stack(idx) match {
+            case r: RunCleanup ⇒ addCleanups(t, r :: acc, idx + 1)
+            case _             ⇒ addCleanups(t, acc, idx + 1)
+          }
+        } else acc
+
+      // run cleanup actions in reverse order, catching exceptions
+      rec(this, Nil) foreach { run ⇒
+        if (Debug) println(s"${ctx.self} running cleanup action")
+        try run.cleanup()
+        catch {
+          case NonFatal(ex) ⇒
+            ctx.system.eventStream.publish(Logging.Error(ex, ctx.self.toString, ProcessInterpreter.this.getClass,
+              s"exception in cleanup handler while canceling process ${process.name}: ${ex.getMessage}"))
         }
-      rec(this)
+      }
+    }
+
+    /*
+     * This method is used when voluntarily giving up, hence failure should
+     * fail the Actor (which will in turn run all remaining cleanups that are
+     * still on the stack).
+     */
+    private def runCleanups(): Unit = {
+      while (ptr > 0) {
+        pop() match {
+          case RunCleanup(cleanup) ⇒ cleanup()
+          case _                   ⇒
+        }
+      }
     }
 
     private def shutdown(): Unit = {

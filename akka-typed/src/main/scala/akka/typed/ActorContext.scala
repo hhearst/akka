@@ -124,7 +124,7 @@ trait ActorContext[T] {
    * protocols can be ingested by this Actor. You are strongly advised to cache
    * these ActorRefs or to stop them when no longer needed.
    */
-  def spawnAdapter[U](f: U ⇒ T): ActorRef[U]
+  def spawnAdapter[U](f: U ⇒ T, name: String = ""): ActorRef[U]
 }
 
 /**
@@ -186,8 +186,9 @@ class StubbedActorContext[T](
 
   def executionContext: ExecutionContextExecutor = system.executionContext
 
-  def spawnAdapter[U](f: U ⇒ T): ActorRef[U] = {
-    val i = Inbox[U](childName.next())
+  def spawnAdapter[U](f: U ⇒ T, name: String = ""): ActorRef[U] = {
+    val n = if (name != "") s"${childName.next()}-$name" else childName.next()
+    val i = Inbox[U](n)
     _children += i.ref.path.name → i
     new internal.FunctionRef[U](
       self.path / i.ref.path.name,

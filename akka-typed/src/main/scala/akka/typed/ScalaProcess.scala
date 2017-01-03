@@ -63,7 +63,7 @@ object ScalaProcess {
 
     trait NextStep[T] {
       def apply[U](mailboxCapacity: Int, body: OpDSL { type Self = T } ⇒ Operation[T, U])(implicit opDSL: OpDSL): Operation[opDSL.Self, U] =
-        Call(Process("nextStep", Duration.Inf, mailboxCapacity, body(null)))
+        Call(Process("nextStep", Duration.Inf, mailboxCapacity, body(null)), None)
     }
     private[typed] object nextStep extends NextStep[Nothing]
   }
@@ -247,7 +247,7 @@ object ScalaProcess {
    * These are the private values that make up the core algebra.
    */
 
-  private[typed] case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2] {
+  private[typed] final case class FlatMap[S, Out1, Out2](first: Operation[S, Out1], then: Out1 ⇒ Operation[S, Out2]) extends Operation[S, Out2] {
     override def toString: String = s"FlatMap($first)"
   }
   private[typed] case object ShortCircuit extends Operation[Nothing, Nothing] {
@@ -258,25 +258,24 @@ object ScalaProcess {
   private[typed] case object Read extends Operation[Nothing, Nothing]
   private[typed] case object ProcessSelf extends Operation[Nothing, ActorRef[Any]]
   private[typed] case object ActorSelf extends Operation[Nothing, ActorRef[ActorCmd[Nothing]]]
-  private[typed] case class Return[T](value: T) extends Operation[Nothing, T]
-  private[typed] case class Call[S, T](process: Process[S, T]) extends Operation[Nothing, T]
-  private[typed] case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
-  private[typed] case class Spawn[S](process: Process[S, Any], deployment: DeploymentConfig) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
-  private[typed] case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, a.Cancellable]
+  private[typed] final case class Return[T](value: T) extends Operation[Nothing, T]
+  private[typed] final case class Call[S, T](process: Process[S, T], replacement: Option[T]) extends Operation[Nothing, T]
+  private[typed] final case class Fork[S](process: Process[S, Any]) extends Operation[Nothing, SubActor[S]]
+  private[typed] final case class Spawn[S](process: Process[S, Any], deployment: DeploymentConfig) extends Operation[Nothing, ActorRef[ActorCmd[S]]]
+  private[typed] final case class Schedule[T](delay: FiniteDuration, msg: T, target: ActorRef[T]) extends Operation[Nothing, a.Cancellable]
   private[typed] sealed trait AbstractWatchRef { type Msg }
-  private[typed] case class WatchRef[T](watchee: ActorRef[Nothing], msg: T, target: ActorRef[T])
+  private[typed] final case class WatchRef[T](watchee: ActorRef[Nothing], msg: T, target: ActorRef[T])
     extends Operation[Nothing, a.Cancellable] with AbstractWatchRef {
     type Msg = T
     override def equals(other: Any) = super.equals(other)
     override def hashCode() = super.hashCode()
   }
-  private[typed] case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
-  private[typed] case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
-  private[typed] case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
-  private[typed] case class StateR[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S ⇒ Seq[T#Event]) extends Operation[Nothing, S]
-  private[typed] case class Forget[T](key: StateKey[T]) extends Operation[Nothing, akka.Done]
-
-  // FIXME figure out cleanup of external resources after a failure
+  private[typed] final case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
+  private[typed] final case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
+  private[typed] final case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
+  private[typed] final case class StateR[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S ⇒ Seq[T#Event]) extends Operation[Nothing, S]
+  private[typed] final case class Forget[T](key: StateKey[T]) extends Operation[Nothing, akka.Done]
+  private[typed] final case class Cleanup(cleanup: () ⇒ Unit) extends Operation[Nothing, akka.Done]
 
   /*
    * The core operations: keep these minimal!
@@ -314,16 +313,18 @@ object ScalaProcess {
 
   /**
    * Execute the given process within the current Actor, await and return that process’ result.
+   * If the process does not return a result (due to a non-matching `filter` expression), the
+   * current process also does not return a result. See `opOrElse` for handling this.
    */
-  def opCall[Self, Out](process: Process[Self, Out])(implicit opDSL: OpDSL): Operation[opDSL.Self, Out] =
-    Call(process)
+  def opCall[Self, Out](process: Process[Self, Out], replacement: Option[Out] = None)(implicit opDSL: OpDSL): Operation[opDSL.Self, Out] =
+    Call(process, replacement)
 
   /**
    * Create and execute a process with a self reference of the given type,
    * await and return that process’ result. This is equivalent to creating
    * a process with [[OpDSL]] and using `call` to execute it.
    */
-  def opNextStep[T] =
+  def opNextStep[T]: OpDSL.NextStep[T] =
     OpDSL.nextStep.asInstanceOf[OpDSL.NextStep[T]]
 
   /**
@@ -419,6 +420,52 @@ object ScalaProcess {
    */
   def opForgetState[T](key: StateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, akka.Done] =
     Forget(key)
+
+  /**
+   * Run the given cleanup handler after the operations that will be chained
+   * off of this one, i.e. this operation must be further transformed to make
+   * sense.
+   *
+   * Usage with explicit combinators:
+   * {{{
+   * opCleanup(() => doCleanup())
+   *   .flatMap { _ =>
+   *     ...
+   *   } // doCleanup() will run here
+   *   .flatMap { ... }
+   * }}}
+   *
+   * Usage with for-expressions:
+   * {{{
+   * (for {
+   *     resource &lt;- obtainResource
+   *     _ &lt;- opCleanup(() => doCleanup(resource))
+   *     ...
+   *   } yield ...
+   * ) // doCleanup() will run here
+   * .flatMap { ... }
+   * }}}
+   *
+   * Unorthodox usage:
+   * {{{
+   * (for {
+   *     resource &lt;- obtainResource
+   *     ...
+   *   } yield opCleanup(() => doCleanup(resource))
+   * ) // doCleanup() will run here
+   * .flatMap { ... }
+   * }}}
+   */
+  def opCleanup(cleanup: () ⇒ Unit)(implicit opDSL: OpDSL): Operation[opDSL.Self, akka.Done] =
+    Cleanup(cleanup)
+
+  /**
+   * Terminate processing here, ignoring further transformations. If this process
+   * has been called by another process then the `replacement` argument to `opCall`
+   * determines whether the calling process continues or halts as well: if no
+   * replacement is given, processing cannot go on.
+   */
+  def opHalt(implicit opDSL: OpDSL): Operation[opDSL.Self, Nothing] = ShortCircuit
 
   /*
    * State Management

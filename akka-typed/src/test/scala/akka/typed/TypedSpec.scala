@@ -24,6 +24,7 @@ import org.scalactic.CanEqual
 import org.junit.runner.RunWith
 import scala.util.control.NonFatal
 import org.scalatest.exceptions.TestFailedException
+import akka.util.TypedMultiMap
 
 /**
  * Helper class for writing tests for typed Actors with ScalaTest.
@@ -180,6 +181,7 @@ object TypedSpec {
 }
 
 class TypedSpecSpec extends TypedSpec {
+
   object `A TypedSpec` {
 
     trait CommonTests {

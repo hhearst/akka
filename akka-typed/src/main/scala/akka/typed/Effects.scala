@@ -64,8 +64,8 @@ class EffectfulActorContext[T](_name: String, _initialBehavior: Behavior[T], _ma
     effectQueue.offer(Spawned(ref.path.name))
     ref
   }
-  override def spawnAdapter[U](f: U ⇒ T): ActorRef[U] = {
-    val ref = super.spawnAdapter(f)
+  override def spawnAdapter[U](f: U ⇒ T, name: String = ""): ActorRef[U] = {
+    val ref = super.spawnAdapter(f, name)
     effectQueue.offer(Spawned(ref.path.name))
     ref
   }
