@@ -812,12 +812,18 @@ object ClusterReceptionist {
      */
     class ClientResponseTunnel(client: ActorRef, timeout: FiniteDuration) extends Actor with ActorLogging {
       context.setReceiveTimeout(timeout)
+
+      private val isAsk = client.path.elements.headOption.contains("temp")
+
       def receive = {
         case Ping ⇒ // keep alive from client
         case ReceiveTimeout ⇒
           log.debug("ClientResponseTunnel for client [{}] stopped due to inactivity", client.path)
           context stop self
-        case msg ⇒ client.tell(msg, Actor.noSender)
+        case msg ⇒
+          client.tell(msg, Actor.noSender)
+          if (isAsk)
+            context stop self
       }
     }
   }
