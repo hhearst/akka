@@ -580,11 +580,41 @@ class ProcessSpec extends TypedSpec {
       calls.reverse should ===(List(1, 0))
     }
 
+    def `must handle ephemeral state`(): Unit = {
+      case class Add(num: Int)
+      object Key extends PersistentStateKey[Int] {
+        type Event = Add
+        def initial = 0
+        def apply(s: Int, ev: Add) = s + ev.num
+        def clazz = classOf[Add]
+      }
+
+      var values = List.empty[Int]
+      def publish(n: Int): Unit = values ::= n
+
+      val ctx = new EffectfulActorContext("state", OpDSL[String] { implicit opDSL ⇒
+        for {
+          i1 ← opUpdateState(Key)(i ⇒ { publish(i); List(Add(2)) → 5 })
+          _ = publish(i1)
+          i2 ← opUpdateAndReadState(Key)(i ⇒ { publish(i); List(Add(2)) })
+          _ = publish(i2)
+          Done ← opForgetState(Key)
+          i3 ← opReadState(Key)
+        } publish(i3)
+      }.toBehavior, 1, system)
+
+      val Spawned(_) = ctx.getEffect()
+      ctx.getAllEffects() should ===(Nil)
+      ctx.isAlive should ===(false)
+      values.reverse should ===(List(0, 5, 2, 4, 0))
+    }
+
   }
 
   object `A ProcessDSL (adapted)` extends CommonTests with AdaptedSystem
 
   object `A TimeoutOrdering` extends PropertyChecks {
+
     def `must sort correctly`(): Unit = {
       forAll { (l: List[Int]) ⇒
         val offsets = (TreeSet.empty[Int] ++ l.filterNot(_ == 1)).toVector
@@ -597,6 +627,7 @@ class ProcessSpec extends TypedSpec {
         }
       }
     }
+
   }
 
 }

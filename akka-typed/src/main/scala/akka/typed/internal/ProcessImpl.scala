@@ -39,8 +39,6 @@ import akka.event.Logging
  *    processes can even be reentrant due to separate unique Traversals)
  *
  * TODO:
- *   process timeout means failure
- *   cleanup actions via State
  *   enable noticing when watchee failed
  */
 private[typed] object ProcessInterpreter {
@@ -93,6 +91,7 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
   private var timeouts = emptyTimeouts
   private var timeoutTask = notScheduled
   private var watchMap = Map.empty[ActorRef[Nothing], Set[AbstractWatchRef]]
+  private var stateMap = Map.empty[StateKey[_], Any]
 
   def management(ctx: ActorContext[ActorCmd[T]], msg: Signal): Behavior[ActorCmd[T]] = {
     msg match {
@@ -231,6 +230,17 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
         watchMap.get(watchee).forall(!_.contains(w))
       }
     }
+  }
+
+  def getState[KT](key: StateKey[KT]): KT = {
+    stateMap.get(key) match {
+      case None    ⇒ key.initial
+      case Some(v) ⇒ v.asInstanceOf[KT]
+    }
+  }
+
+  def setState[KT](key: StateKey[KT], value: KT): Unit = {
+    stateMap = stateMap.updated(key, value)
   }
 
   private class Traversal[Tself](val process: Process[Tself, Any], ctx: ActorContext[ActorCmd[T]])
@@ -400,6 +410,24 @@ private[typed] class ProcessInterpreter[T](initial: ⇒ Process[T, Any]) extends
             valueOrTrampoline()
           case w: WatchRef[_] ⇒
             push(watch(ctx, w))
+            valueOrTrampoline()
+          case state: State[s, k, ev, ex] ⇒
+            val current = getState(state.key)
+            val (events, read) = state.transform(current)
+            val next = events.foldLeft(current)(state.key.apply(_, _))
+            setState(state.key, next)
+            push(read)
+            valueOrTrampoline()
+          case state: StateR[s, k, ev] ⇒
+            val current = getState(state.key)
+            val events = state.transform(current)
+            val next = events.foldLeft(current)(state.key.apply(_, _))
+            setState(state.key, next)
+            push(next)
+            valueOrTrampoline()
+          case Forget(key) ⇒
+            stateMap -= key
+            push(Done)
             valueOrTrampoline()
           case Cleanup(cleanup) ⇒
             val f @ FlatMap(_, _) = pop() // this is ensured at the end of initialize()

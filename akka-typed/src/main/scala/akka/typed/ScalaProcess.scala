@@ -272,8 +272,8 @@ object ScalaProcess {
   }
   private[typed] final case class Replay[T](key: StateKey[T]) extends Operation[Nothing, T]
   private[typed] final case class Snapshot[T](key: StateKey[T]) extends Operation[Nothing, T]
-  private[typed] final case class State[S, T <: StateKey[S], E](key: T, afterUpdates: Boolean, transform: S ⇒ (Seq[T#Event], E)) extends Operation[Nothing, E]
-  private[typed] final case class StateR[S, T <: StateKey[S]](key: T, afterUpdates: Boolean, transform: S ⇒ Seq[T#Event]) extends Operation[Nothing, S]
+  private[typed] final case class State[S, T <: StateKey[S], Ev, Ex](key: T { type Event = Ev }, afterUpdates: Boolean, transform: S ⇒ (Seq[Ev], Ex)) extends Operation[Nothing, Ex]
+  private[typed] final case class StateR[S, T <: StateKey[S], Ev](key: T { type Event = Ev }, afterUpdates: Boolean, transform: S ⇒ Seq[Ev]) extends Operation[Nothing, S]
   private[typed] final case class Forget[T](key: StateKey[T]) extends Operation[Nothing, akka.Done]
   private[typed] final case class Cleanup(cleanup: () ⇒ Unit) extends Operation[Nothing, akka.Done]
 
@@ -376,7 +376,7 @@ object ScalaProcess {
    * `afterUpdates` is `true`.
    */
   def opReadState[T](key: StateKey[T], afterUpdates: Boolean = true)(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
-    State[T, StateKey[T], T](key, afterUpdates, any2Nil)
+    State[T, StateKey[T], key.Event, T](key, afterUpdates, any2Nil)
 
   /**
    * Update the state stored for the given [[StateKey]] by emitting events that
@@ -384,8 +384,8 @@ object ScalaProcess {
    * until after all outstanding updates for the key have been completed if
    * `afterUpdates` is `true`.
    */
-  def opUpdateState[T, E](key: StateKey[T], afterUpdates: Boolean = true)(
-    transform: T ⇒ (Seq[key.Event], E))(implicit opDSL: OpDSL): Operation[opDSL.Self, E] =
+  def opUpdateState[T, Ev, Ex](key: StateKey[T] { type Event = Ev }, afterUpdates: Boolean = true)(
+    transform: T ⇒ (Seq[Ev], Ex))(implicit opDSL: OpDSL): Operation[opDSL.Self, Ex] =
     State(key, afterUpdates, transform)
 
   /**
@@ -393,8 +393,8 @@ object ScalaProcess {
    * process is suspended until after all outstanding updates for the key have been
    * completed if `afterUpdates` is `true`.
    */
-  def opUpdateAndReadState[T](key: StateKey[T], afterUpdates: Boolean = true)(
-    transform: T ⇒ Seq[key.Event])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+  def opUpdateAndReadState[T, Ev](key: StateKey[T] { type Event = Ev }, afterUpdates: Boolean = true)(
+    transform: T ⇒ Seq[Ev])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
     StateR(key, afterUpdates, transform)
 
   /**
@@ -406,13 +406,15 @@ object ScalaProcess {
     Snapshot(key)
 
   /**
+   * FIXME not yet implemented
+   *
    * Restore the state for the given [[StateKey]] from persistent event storage.
    * If a snapshot is found it will be used as the starting point for the replay,
    * otherwise events are replayed from the beginning of the event log, starting
    * with the given initial data as the state before the first event is applied.
    */
-  def opReplayPersistentState[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
-    Replay(key)
+  //def opReplayPersistentState[T](key: PersistentStateKey[T])(implicit opDSL: OpDSL): Operation[opDSL.Self, T] =
+  //  Replay(key)
 
   /**
    * Remove the given [[StateKey]] from this Actor’s storage. The slot can be
