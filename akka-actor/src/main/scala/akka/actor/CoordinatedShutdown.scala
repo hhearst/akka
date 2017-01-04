@@ -34,17 +34,17 @@ import java.util.concurrent.CompletionStage
 import java.util.Optional
 
 object CoordinatedShutdown extends ExtensionId[CoordinatedShutdown] with ExtensionIdProvider {
-  val PhaseCustom1 = "custom-1"
-  val PhaseCustom2 = "custom-2"
-  val PhaseCustom3 = "custom-3"
+  val PhaseBeforeServiceUnbind = "before-service-unbind"
   val PhaseServiceUnbind = "service-unbind"
   val PhaseServiceRequestsDone = "service-requests-done"
   val PhaseServiceStop = "service-stop"
-  val PhaseClusterLeave = "cluster-leave"
+  val PhaseBeforeClusterShutdown = "before-cluster-shutdown"
   val PhaseClusterShardingShutdownRegion = "cluster-sharding-shutdown-region"
+  val PhaseClusterLeave = "cluster-leave"
   val PhaseClusterExiting = "cluster-exiting"
   val PhaseClusterExitingDone = "cluster-exiting-done"
   val PhaseClusterShutdown = "cluster-shutdown"
+  val PhaseBeforeActorSystemTerminate = "before-actor-system-terminate"
   val PhaseActorSystemTerminate = "actor-system-terminate"
 
   @volatile private var runningJvmHook = false
@@ -344,7 +344,7 @@ final class CoordinatedShutdown private[akka] (
    * The returned `CompletionStage` is completed when all such tasks have been completed,
    * or there is a failure when recovery is disabled.
    *
-   * It's safe to call this method multiple times. It will only run the once.
+   * It's safe to call this method multiple times. It will only run once.
    */
   def run(fromPhase: Optional[String]): CompletionStage[Done] =
     run(fromPhase.asScala).toJava

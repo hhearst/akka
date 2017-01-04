@@ -107,17 +107,17 @@ class CoordinatedShutdownSpec extends AkkaSpec {
     "have pre-defined phases from config" in {
       import CoordinatedShutdown._
       CoordinatedShutdown(system).orderedPhases should ===(List(
-        PhaseCustom1,
+        PhaseBeforeServiceUnbind,
         PhaseServiceUnbind,
         PhaseServiceRequestsDone,
         PhaseServiceStop,
-        PhaseCustom2,
+        PhaseBeforeClusterShutdown,
         PhaseClusterShardingShutdownRegion,
         PhaseClusterLeave,
         PhaseClusterExiting,
         PhaseClusterExitingDone,
         PhaseClusterShutdown,
-        PhaseCustom3,
+        PhaseBeforeActorSystemTerminate,
         PhaseActorSystemTerminate))
     }
 
