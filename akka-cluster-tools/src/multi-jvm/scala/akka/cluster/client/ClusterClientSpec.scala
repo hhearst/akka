@@ -436,7 +436,7 @@ class ClusterClientSpec extends MultiNodeSpec(ClusterClientSpec) with STMultiNod
           system.name,
           ConfigFactory.parseString(
             s"""
-              akka.remote.artery.canonical.port=$port"
+              akka.remote.artery.canonical.port=$port
               akka.remote.netty.tcp.port=$port
               """).withFallback(system.settings.config))
         Cluster(sys2).join(Cluster(sys2).selfAddress)
